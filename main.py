@@ -22,6 +22,8 @@ class Settings:
     default_notice_text: str
     scheduler_check_seconds: int
     media_group_delay: float
+    database_backup_dir: str
+    database_backup_keep: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -45,6 +47,10 @@ class Settings:
         if media_group_delay < 0.2:
             raise RuntimeError("MEDIA_GROUP_DELAY должен быть не меньше 0.2")
 
+        backup_keep = int(os.getenv("DATABASE_BACKUP_KEEP", "7"))
+        if backup_keep < 1:
+            raise RuntimeError("DATABASE_BACKUP_KEEP must be at least 1")
+
         return cls(
             bot_token=token,
             database_path=os.getenv(
@@ -60,6 +66,10 @@ class Settings:
             ).strip(),
             scheduler_check_seconds=check_seconds,
             media_group_delay=media_group_delay,
+            database_backup_dir=os.getenv(
+                "DATABASE_BACKUP_DIR", "backups"
+            ).strip(),
+            database_backup_keep=backup_keep,
         )
 
 
@@ -71,7 +81,11 @@ async def main() -> None:
 
     settings = Settings.from_env()
 
-    db = Database(settings.database_path)
+    db = Database(
+        settings.database_path,
+        backup_dir=settings.database_backup_dir,
+        backup_keep=settings.database_backup_keep,
+    )
     await db.init()
 
     bot = Bot(

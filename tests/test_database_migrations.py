@@ -1,4 +1,6 @@
 import sqlite3
+
+import aiosqlite
 from datetime import datetime, timezone
 import tempfile
 import unittest
@@ -7,9 +9,11 @@ from pathlib import Path
 from database import (
     DEFAULT_MIGRATIONS,
     Database,
+    DatabaseBackupError,
     DatabaseMigrationError,
     DatabasePreflightError,
     Migration,
+    SQLiteBackupManager,
     apply_legacy_schema,
 )
 
@@ -333,6 +337,210 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             conn.close()
         self.assertEqual(count, 0)
+
+    def _backup_dir(self) -> Path:
+        return Path(self.temp_dir.name) / "backups"
+
+    def _backup_files(self) -> list[Path]:
+        backup_dir = self._backup_dir()
+        return sorted(backup_dir.glob("*.sqlite3")) if backup_dir.exists() else []
+
+    async def test_legacy_baseline_creates_backup_before_marking_migration(self) -> None:
+        await self._create_legacy_database(with_data=True)
+        db = Database(self.db_path, backup_dir=self._backup_dir())
+        await db.init()
+        backups = self._backup_files()
+        self.assertEqual(len(backups), 1)
+        backup = sqlite3.connect(backups[0])
+        try:
+            self.assertEqual(
+                backup.execute("SELECT group_title FROM tenants WHERE owner_id = 1").fetchone()[0],
+                "Legacy group",
+            )
+            self.assertIsNone(
+                backup.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+                ).fetchone()
+            )
+        finally:
+            backup.close()
+        await db.close()
+
+    async def test_migrated_database_without_pending_migrations_creates_no_backup(self) -> None:
+        await self._create_legacy_database()
+        first = Database(self.db_path, backup_dir=self._backup_dir())
+        await first.init()
+        await first.close()
+        first_backups = [backup.name for backup in self._backup_files()]
+
+        second = Database(self.db_path, backup_dir=self._backup_dir())
+        await second.init()
+        await second.close()
+        self.assertEqual([backup.name for backup in self._backup_files()], first_backups)
+
+    async def test_pending_future_migration_creates_backup_before_change(self) -> None:
+        initial = Database(self.db_path, backup_dir=self._backup_dir())
+        await initial.init()
+        await initial.close()
+
+        async def add_marker(conn) -> None:
+            await conn.execute("CREATE TABLE migration_marker (value TEXT NOT NULL)")
+
+        upgraded = Database(
+            self.db_path,
+            backup_dir=self._backup_dir(),
+            migrations=(*DEFAULT_MIGRATIONS, Migration(2, "add_marker", add_marker)),
+        )
+        await upgraded.init()
+        backups = self._backup_files()
+        self.assertEqual(len(backups), 1)
+        backup = sqlite3.connect(backups[0])
+        try:
+            self.assertIsNone(
+                backup.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'migration_marker'"
+                ).fetchone()
+            )
+        finally:
+            backup.close()
+        marker = await upgraded.conn.execute("SELECT name FROM sqlite_master WHERE name = 'migration_marker'")
+        self.assertIsNotNone(await marker.fetchone())
+        await upgraded.close()
+
+    async def test_empty_database_creates_no_backup(self) -> None:
+        db = Database(self.db_path, backup_dir=self._backup_dir())
+        await db.init()
+        self.assertEqual(self._backup_files(), [])
+        await db.close()
+
+    async def test_backup_passes_integrity_and_foreign_key_checks(self) -> None:
+        await self._create_legacy_database(with_data=True)
+        manager = SQLiteBackupManager(
+            source_path=self.db_path,
+            backup_dir=self._backup_dir(),
+            keep=7,
+        )
+        db = Database(
+            self.db_path,
+            backup_dir=self._backup_dir(),
+            backup_manager=manager,
+        )
+        await db.init()
+        backup = self._backup_files()[0]
+        manager.verify_backup(backup)
+        await db.close()
+
+    async def test_invalid_backup_blocks_migration_before_schema_change(self) -> None:
+        await self._create_legacy_database(with_data=True)
+
+        class InvalidBackupManager(SQLiteBackupManager):
+            async def create_backup(self, source, *, target_version):
+                self.backup_dir.mkdir(parents=True, exist_ok=True)
+                broken = self.backup_dir / "broken.sqlite3"
+                broken.write_text("not sqlite", encoding="utf-8")
+                return broken
+
+        manager = InvalidBackupManager(
+            source_path=self.db_path,
+            backup_dir=self._backup_dir(),
+            keep=7,
+        )
+        db = Database(self.db_path, backup_manager=manager)
+        with self.assertRaises(DatabaseBackupError):
+            await db.init()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
+    async def test_backup_creation_error_blocks_migration(self) -> None:
+        await self._create_legacy_database()
+
+        class FailingBackupManager(SQLiteBackupManager):
+            async def create_backup(self, source, *, target_version):
+                raise DatabaseBackupError("intentional backup failure")
+
+        manager = FailingBackupManager(
+            source_path=self.db_path,
+            backup_dir=self._backup_dir(),
+            keep=7,
+        )
+        db = Database(self.db_path, backup_manager=manager)
+        with self.assertRaisesRegex(DatabaseBackupError, "intentional backup failure"):
+            await db.init()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+                ).fetchone()
+            )
+        finally:
+            conn.close()
+
+    async def test_backup_restores_pre_migration_data(self) -> None:
+        await self._create_legacy_database(with_data=True)
+        baseline = Database(self.db_path, backup_dir=self._backup_dir())
+        await baseline.init()
+        await baseline.close()
+        for backup in self._backup_files():
+            backup.unlink()
+
+        async def rename_group(conn) -> None:
+            await conn.execute(
+                "UPDATE tenants SET group_title = 'Migrated group' WHERE owner_id = 1"
+            )
+
+        upgraded = Database(
+            self.db_path,
+            backup_dir=self._backup_dir(),
+            migrations=(*DEFAULT_MIGRATIONS, Migration(2, "rename_group", rename_group)),
+        )
+        await upgraded.init()
+        current = await upgraded.conn.execute(
+            "SELECT group_title FROM tenants WHERE owner_id = 1"
+        )
+        self.assertEqual((await current.fetchone())["group_title"], "Migrated group")
+        await upgraded.close()
+
+        backup = sqlite3.connect(self._backup_files()[0])
+        try:
+            self.assertEqual(
+                backup.execute("SELECT group_title FROM tenants WHERE owner_id = 1").fetchone()[0],
+                "Legacy group",
+            )
+            self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+        finally:
+            backup.close()
+
+    async def test_backup_names_are_unique_and_rotation_preserves_other_files(self) -> None:
+        source = await aiosqlite.connect(self.db_path)
+        await apply_legacy_schema(source)
+        await source.commit()
+        manager = SQLiteBackupManager(
+            source_path=self.db_path,
+            backup_dir=self._backup_dir(),
+            keep=2,
+        )
+        other_file = self._backup_dir() / "do-not-delete.txt"
+        self._backup_dir().mkdir(parents=True, exist_ok=True)
+        other_file.write_text("keep", encoding="utf-8")
+        created = []
+        for _ in range(3):
+            backup = await manager.create_backup(source, target_version=2)
+            manager.verify_backup(backup)
+            created.append(backup.name)
+        manager.rotate_after_success()
+        await source.close()
+
+        self.assertEqual(len(set(created)), 3)
+        self.assertEqual(len(self._backup_files()), 2)
+        self.assertTrue(other_file.exists())
 
     async def test_preflight_rejects_orphaned_legacy_foreign_key(self) -> None:
         await self._create_legacy_database()

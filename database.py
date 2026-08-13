@@ -1,11 +1,18 @@
 import asyncio
+import hashlib
+import logging
+import re
 import sqlite3
+import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiosqlite
+
+
+logger = logging.getLogger(__name__)
 
 
 MigrationApply = Callable[[aiosqlite.Connection], Awaitable[None]]
@@ -17,6 +24,114 @@ class DatabaseMigrationError(RuntimeError):
 
 class DatabasePreflightError(DatabaseMigrationError):
     """SQLite did not pass mandatory checks before migration."""
+
+
+class DatabaseBackupError(DatabaseMigrationError):
+    """A required pre-migration SQLite backup could not be verified."""
+
+
+class SQLiteBackupManager:
+    """Creates SQLite-aware local restore points for this application only."""
+
+    def __init__(
+        self,
+        *,
+        source_path: str,
+        backup_dir: str | Path,
+        keep: int,
+    ) -> None:
+        if keep < 1:
+            raise ValueError("DATABASE_BACKUP_KEEP must be at least 1")
+        self.source_path = Path(source_path)
+        self.backup_dir = Path(backup_dir)
+        self.keep = keep
+        safe_stem = re.sub(r"[^A-Za-z0-9_-]+", "_", self.source_path.stem)
+        source_hash = hashlib.sha256(
+            str(self.source_path.absolute()).encode("utf-8")
+        ).hexdigest()[:12]
+        self._filename_prefix = f"{safe_stem or 'database'}_{source_hash}"
+
+    async def create_backup(
+        self,
+        source: aiosqlite.Connection,
+        *,
+        target_version: int,
+    ) -> Path:
+        try:
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+            nonce = uuid.uuid4().hex[:12]
+            filename = (
+                f"{self._filename_prefix}_pre_migration_to_v{target_version}_"
+                f"{timestamp}_{nonce}.sqlite3"
+            )
+            destination = self.backup_dir / filename
+            temporary = destination.with_suffix(".sqlite3.tmp")
+            target = sqlite3.connect(temporary)
+            try:
+                await source.backup(target)
+            finally:
+                target.close()
+            temporary.replace(destination)
+            return destination
+        except Exception as exc:
+            try:
+                if 'temporary' in locals() and temporary.exists():
+                    temporary.unlink()
+            except OSError:
+                logger.warning("Could not remove incomplete SQLite backup", exc_info=True)
+            raise DatabaseBackupError(
+                "Unable to create pre-migration SQLite backup: " + str(exc)
+            ) from exc
+
+    def verify_backup(self, backup_path: Path) -> None:
+        if not backup_path.is_file():
+            raise DatabaseBackupError("SQLite backup file was not created")
+        try:
+            connection = sqlite3.connect(f"{backup_path.absolute().as_uri()}?mode=ro", uri=True)
+            try:
+                integrity = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+                if integrity != ["ok"]:
+                    raise DatabaseBackupError(
+                        "SQLite backup integrity_check failed: " + "; ".join(integrity)
+                    )
+                foreign_keys = list(connection.execute("PRAGMA foreign_key_check"))
+                if foreign_keys:
+                    raise DatabaseBackupError(
+                        "SQLite backup foreign_key_check found broken references: "
+                        f"{len(foreign_keys)}"
+                    )
+            finally:
+                connection.close()
+        except DatabaseBackupError:
+            raise
+        except sqlite3.Error as exc:
+            raise DatabaseBackupError(
+                "Unable to verify SQLite backup: " + str(exc)
+            ) from exc
+
+    def rotate_after_success(self) -> None:
+        try:
+            backups = sorted(
+                self.backup_dir.glob(
+                    f"{self._filename_prefix}_pre_migration_to_v*.sqlite3"
+                ),
+                key=lambda item: (item.stat().st_mtime_ns, item.name),
+                reverse=True,
+            )
+        except OSError:
+            logger.warning("Could not enumerate local SQLite backups", exc_info=True)
+            return
+
+        for stale_backup in backups[self.keep:]:
+            try:
+                stale_backup.unlink()
+            except OSError:
+                logger.warning(
+                    "Could not remove expired local SQLite backup %s",
+                    stale_backup,
+                    exc_info=True,
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,12 +302,25 @@ class Database:
         path: str,
         *,
         migrations: Sequence[Migration] | None = None,
+        backup_dir: str | Path | None = None,
+        backup_keep: int = 7,
+        backup_manager: SQLiteBackupManager | None = None,
     ) -> None:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
         self._migrations = tuple(
             DEFAULT_MIGRATIONS if migrations is None else migrations
+        )
+        resolved_backup_dir = (
+            Path(backup_dir)
+            if backup_dir is not None
+            else Path(path).parent / "backups"
+        )
+        self._backup_manager = backup_manager or SQLiteBackupManager(
+            source_path=path,
+            backup_dir=resolved_backup_dir,
+            keep=backup_keep,
         )
         self._validate_migrations()
 
@@ -212,9 +340,16 @@ class Database:
             await self.conn.execute("PRAGMA synchronous = NORMAL")
             await self.conn.execute("PRAGMA busy_timeout = 5000")
             await self.run_preflight()
-            await self._ensure_migration_table()
-            await self._validate_migration_table()
-            await self._apply_pending_migrations()
+            history, has_migration_table = await self._load_migration_history()
+            self._validate_migration_history(history)
+            pending = self._pending_migrations(history)
+            if pending and not await self._is_new_database():
+                await self._backup_before_migrations(pending)
+            if not has_migration_table:
+                await self._ensure_migration_table()
+            else:
+                await self._validate_migration_table()
+            await self._apply_pending_migrations(history)
             await self.run_preflight()
         except Exception:
             await self.close()
@@ -279,9 +414,10 @@ class Database:
                 "schema_migrations must have PRIMARY KEY(version)"
             )
 
-    async def _apply_pending_migrations(self) -> None:
-        history = await self._read_migration_history()
-        self._validate_migration_history(history)
+    async def _apply_pending_migrations(
+        self,
+        history: Sequence[tuple[int, str]],
+    ) -> None:
         applied_versions = {version for version, _ in history}
 
         for migration in self._migrations:
@@ -305,6 +441,55 @@ class Database:
             except Exception:
                 await self.conn.rollback()
                 raise
+
+    async def _load_migration_history(
+        self,
+    ) -> tuple[list[tuple[int, str]], bool]:
+        if not await self._table_exists("schema_migrations"):
+            return [], False
+        await self._validate_migration_table()
+        return await self._read_migration_history(), True
+
+    def _pending_migrations(
+        self,
+        history: Sequence[tuple[int, str]],
+    ) -> tuple[Migration, ...]:
+        applied_versions = {version for version, _ in history}
+        return tuple(
+            migration
+            for migration in self._migrations
+            if migration.version not in applied_versions
+        )
+
+    async def _is_new_database(self) -> bool:
+        cursor = await self.conn.execute(
+            """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name NOT LIKE 'sqlite_%'
+            LIMIT 1
+            """
+        )
+        return await cursor.fetchone() is None
+
+    async def _backup_before_migrations(
+        self,
+        pending: Sequence[Migration],
+    ) -> None:
+        backup_path = await self._backup_manager.create_backup(
+            self.conn,
+            target_version=pending[-1].version,
+        )
+        self._backup_manager.verify_backup(backup_path)
+        self._backup_manager.rotate_after_success()
+
+    async def _table_exists(self, table: str) -> bool:
+        cursor = await self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        )
+        return await cursor.fetchone() is not None
 
     async def _read_migration_history(self) -> list[tuple[int, str]]:
         cursor = await self.conn.execute(
