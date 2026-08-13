@@ -20,8 +20,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
@@ -32,19 +32,22 @@ jobs:
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
 
-      - name: Prepare files
+      - name: Prepare deployment archive
         run: |
-                tar \
+          tar \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='.env' \
             --exclude='.venv' \
             --exclude='*.sqlite3' \
             --exclude='*.db' \
+            --exclude='gha-creds-*.json' \
             -czf /tmp/telegram-bot-deploy.tar.gz .
 
-      - name: Upload to VM
+      - name: Upload files to VM
         run: |
           gcloud compute scp \
             /tmp/telegram-bot-deploy.tar.gz \
@@ -54,7 +57,7 @@ jobs:
             --tunnel-through-iap \
             --quiet
 
-      - name: Install and restart bot
+      - name: Install update and restart bot
         run: |
           gcloud compute ssh "${VM_NAME}" \
             --project="${PROJECT_ID}" \
@@ -63,15 +66,30 @@ jobs:
             --quiet \
             --command='
               set -e
-              DEPLOY_DIR=/home/takrillions/Telegram_Bot_Submissions-main
 
-              sudo tar -xzf /tmp/telegram-bot-deploy.tar.gz -C "$DEPLOY_DIR"
+              DEPLOY_DIR="/home/takrillions/Telegram_Bot_Submissions-main"
+
+              sudo tar \
+                -xzf /tmp/telegram-bot-deploy.tar.gz \
+                -C "$DEPLOY_DIR"
+
               sudo chown -R takrillions:takrillions "$DEPLOY_DIR"
 
-              sudo -u takrillions "$DEPLOY_DIR/.venv/bin/pip" install -r "$DEPLOY_DIR/requirements.txt"
+              sudo -u takrillions \
+                "$DEPLOY_DIR/.venv/bin/pip" \
+                install -r "$DEPLOY_DIR/requirements.txt"
 
               sudo systemctl restart telegram-bot
-              sudo systemctl is-active --quiet telegram-bot
+
+              sleep 3
+
+              if ! sudo systemctl is-active --quiet telegram-bot; then
+                echo "Telegram bot failed to start"
+                sudo journalctl -u telegram-bot -n 50 --no-pager
+                exit 1
+              fi
+
+              echo "Telegram bot successfully deployed and restarted"
 
               rm -f /tmp/telegram-bot-deploy.tar.gz
             '
