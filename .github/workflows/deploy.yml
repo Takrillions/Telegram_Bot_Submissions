@@ -1,0 +1,78 @@
+name: Deploy Telegram Bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: project-6bd5d4f2-e1f7-4170-8cc
+  ZONE: us-east1-d
+  VM_NAME: telegram-bot-submissions
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ env.PROJECT_ID }}
+          workload_identity_provider: projects/54487318425/locations/global/workloadIdentityPools/github/providers/github-provider
+          service_account: github-deployer@project-6bd5d4f2-e1f7-4170-8cc.iam.gserviceaccount.com
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Prepare files
+        run: |
+          rm -f gha-creds-*.json
+          tar \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.env' \
+            --exclude='.venv' \
+            --exclude='*.sqlite3' \
+            --exclude='*.db' \
+            -czf /tmp/telegram-bot-deploy.tar.gz .
+
+      - name: Upload to VM
+        run: |
+          gcloud compute scp \
+            /tmp/telegram-bot-deploy.tar.gz \
+            "${VM_NAME}:/tmp/telegram-bot-deploy.tar.gz" \
+            --project="${PROJECT_ID}" \
+            --zone="${ZONE}" \
+            --tunnel-through-iap \
+            --quiet
+
+      - name: Install and restart bot
+        run: |
+          gcloud compute ssh "${VM_NAME}" \
+            --project="${PROJECT_ID}" \
+            --zone="${ZONE}" \
+            --tunnel-through-iap \
+            --quiet \
+            --command='
+              set -e
+              DEPLOY_DIR=/home/takrillions/Telegram_Bot_Submissions-main
+
+              sudo tar -xzf /tmp/telegram-bot-deploy.tar.gz -C "$DEPLOY_DIR"
+              sudo chown -R takrillions:takrillions "$DEPLOY_DIR"
+
+              sudo -u takrillions "$DEPLOY_DIR/.venv/bin/pip" install -r "$DEPLOY_DIR/requirements.txt"
+
+              sudo systemctl restart telegram-bot
+              sudo systemctl is-active --quiet telegram-bot
+
+              rm -f /tmp/telegram-bot-deploy.tar.gz
+            '
