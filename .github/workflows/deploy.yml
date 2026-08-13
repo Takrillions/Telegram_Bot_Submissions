@@ -35,8 +35,7 @@ jobs:
 
       - name: Prepare files
         run: |
-          rm -f gha-creds-*.json
-          tar \
+                tar \
             --exclude='.git' \
             --exclude='.github' \
             --exclude='.env' \
