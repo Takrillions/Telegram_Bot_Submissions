@@ -282,6 +282,7 @@ async def apply_legacy_schema(conn: aiosqlite.Connection) -> None:
 DEFAULT_MIGRATIONS = (
     Migration(1, "baseline_legacy_schema", apply_legacy_schema),
 )
+CURRENT_SCHEMA_VERSION = DEFAULT_MIGRATIONS[-1].version
 
 
 def utc_now() -> datetime:
@@ -309,6 +310,7 @@ class Database:
         self.path = path
         self._conn: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self.applied_migration_versions: tuple[int, ...] = ()
         self._migrations = tuple(
             DEFAULT_MIGRATIONS if migrations is None else migrations
         )
@@ -329,6 +331,26 @@ class Database:
         if self._conn is None:
             raise RuntimeError("Database.init() must be called first")
         return self._conn
+
+    async def inspect_pending_migrations(self) -> tuple[Migration, ...]:
+        """Read-only release validation: never applies or records migrations."""
+        if self._conn is not None:
+            raise RuntimeError("Database connection is already open")
+        self._conn = await aiosqlite.connect(self.path)
+        self._conn.row_factory = sqlite3.Row
+        try:
+            await self.conn.execute("PRAGMA foreign_keys = ON")
+            await self.conn.execute("PRAGMA busy_timeout = 5000")
+            await self.run_preflight()
+            history, _ = await self._load_migration_history()
+            self._validate_migration_history(history)
+            if not history:
+                existing = await self._existing_legacy_tables()
+                if existing:
+                    await self._validate_legacy_schema(existing)
+            return self._pending_migrations(history)
+        finally:
+            await self.close()
 
     async def init(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -420,6 +442,7 @@ class Database:
     ) -> None:
         applied_versions = {version for version, _ in history}
 
+        newly_applied: list[int] = []
         for migration in self._migrations:
             if migration.version in applied_versions:
                 continue
@@ -438,9 +461,11 @@ class Database:
                     (migration.version, migration.name, dt_to_db(utc_now())),
                 )
                 await self.conn.commit()
+                newly_applied.append(migration.version)
             except Exception:
                 await self.conn.rollback()
                 raise
+        self.applied_migration_versions = tuple(newly_applied)
 
     async def _load_migration_history(
         self,

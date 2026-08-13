@@ -6,6 +6,10 @@ on:
       - main
   workflow_dispatch:
 
+concurrency:
+  group: telegram-bot-production
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -47,7 +51,7 @@ jobs:
             --exclude='gha-creds-*.json' \
             -czf /tmp/telegram-bot-deploy.tar.gz .
 
-      - name: Upload files to VM
+      - name: Upload release archive and deploy script to VM
         run: |
           gcloud compute scp \
             /tmp/telegram-bot-deploy.tar.gz \
@@ -57,39 +61,14 @@ jobs:
             --tunnel-through-iap \
             --quiet
 
-      - name: Install update and restart bot
+      - name: Upload deploy script to VM
         run: |
-          gcloud compute ssh "${VM_NAME}" \
-            --project="${PROJECT_ID}" \
-            --zone="${ZONE}" \
-            --tunnel-through-iap \
-            --quiet \
-            --command='
-              set -e
+          gcloud compute scp scripts/deploy_release.sh "${VM_NAME}:/tmp/deploy_release.sh" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet
 
-              DEPLOY_DIR="/home/takrillions/Telegram_Bot_Submissions-main"
-
-              sudo tar \
-                -xzf /tmp/telegram-bot-deploy.tar.gz \
-                -C "$DEPLOY_DIR"
-
-              sudo chown -R takrillions:takrillions "$DEPLOY_DIR"
-
-              sudo -u takrillions \
-                "$DEPLOY_DIR/.venv/bin/pip" \
-                install -r "$DEPLOY_DIR/requirements.txt"
-
-              sudo systemctl restart telegram-bot
-
-              sleep 3
-
-              if ! sudo systemctl is-active --quiet telegram-bot; then
-                echo "Telegram bot failed to start"
-                sudo journalctl -u telegram-bot -n 50 --no-pager
-                exit 1
-              fi
-
-              echo "Telegram bot successfully deployed and restarted"
-
-              rm -f /tmp/telegram-bot-deploy.tar.gz
-            '
+      - name: Deploy release and collect diagnostics
+        run: |
+          RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::12}"
+          gcloud compute ssh "${VM_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet --command="bash /tmp/deploy_release.sh /tmp/telegram-bot-deploy.tar.gz ${RELEASE_ID} ${GITHUB_SHA}" || {
+            gcloud compute ssh "${VM_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet --command='sudo journalctl -u telegram-bot -n 100 --no-pager' || true
+            exit 1
+          }

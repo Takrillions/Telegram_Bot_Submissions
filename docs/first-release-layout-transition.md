@@ -1,0 +1,3 @@
+# First release-layout transition
+
+Do not run this document without explicit production approval. Read the actual `telegram-bot.service` first. Preserve `/home/takrillions/Telegram_Bot_Submissions-main`, determine the effective `DATABASE_PATH` without printing secrets, stop the service, create a SQLite-aware verified copy in `shared/data`, copy `.env` to `shared/.env` with mode 0600, set absolute shared `DATABASE_PATH` and `DATABASE_BACKUP_DIR`, then adapt the unit to `/home/takrillions/telegram-bot/current`. If failure occurs before migration, restore the old unit and service. If migration succeeds but readiness fails, stop and make a manual recovery decision; do not automatically restore SQLite or start old code.

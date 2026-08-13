@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import logging
 import os
@@ -9,6 +10,7 @@ from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
 from database import Database
+from release_runtime import clear_readiness, write_readiness
 from handlers import FeedbackRuntime, TopicCleaner, register_handlers
 from scheduler import TenantScheduler
 
@@ -24,6 +26,8 @@ class Settings:
     media_group_delay: float
     database_backup_dir: str
     database_backup_keep: int
+    readiness_path: str
+    release_id: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -70,68 +74,66 @@ class Settings:
                 "DATABASE_BACKUP_DIR", "backups"
             ).strip(),
             database_backup_keep=backup_keep,
+            readiness_path=os.getenv("READINESS_PATH", "").strip(),
+            release_id=os.getenv("RELEASE_ID", "local").strip() or "local",
         )
 
 
-async def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-    settings = Settings.from_env()
-
-    db = Database(
+async def _create_database(settings: Settings) -> Database:
+    return Database(
         settings.database_path,
         backup_dir=settings.database_backup_dir,
         backup_keep=settings.database_backup_keep,
     )
+
+
+async def validate_release() -> None:
+    settings = Settings.from_env()
+    db = await _create_database(settings)
+    await db.inspect_pending_migrations()
+    bot = Bot(token=settings.bot_token)
+    try:
+        await bot.get_me()
+    finally:
+        await bot.session.close()
+
+
+async def migrate_only() -> tuple[int, ...]:
+    settings = Settings.from_env()
+    db = await _create_database(settings)
+    try:
+        await db.init()
+        return db.applied_migration_versions
+    finally:
+        await db.close()
+
+
+async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    settings = Settings.from_env()
+    clear_readiness(settings.readiness_path)
+    db = await _create_database(settings)
     await db.init()
-
-    bot = Bot(
-        token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-
+    bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
-    logging.info("Starting @%s (%s)", me.username, me.id)
-
-    runtime = FeedbackRuntime(
-        bot=bot,
-        db=db,
-        media_group_delay=settings.media_group_delay,
-    )
+    runtime = FeedbackRuntime(bot=bot, db=db, media_group_delay=settings.media_group_delay)
     cleaner = TopicCleaner(bot=bot, db=db)
-
     dp = Dispatcher()
-    register_handlers(
-        dispatcher=dp,
-        bot=bot,
-        db=db,
-        runtime=runtime,
-        cleaner=cleaner,
-        settings=settings,
-    )
-
-    scheduler = TenantScheduler(
-        bot=bot,
-        db=db,
-        cleaner=cleaner,
-        check_seconds=settings.scheduler_check_seconds,
-    )
-
+    register_handlers(dispatcher=dp, bot=bot, db=db, runtime=runtime, cleaner=cleaner, settings=settings)
+    scheduler = TenantScheduler(bot=bot, db=db, cleaner=cleaner, check_seconds=settings.scheduler_check_seconds)
     scheduler.start()
     await scheduler.tick()
 
+    async def mark_ready(*_) -> None:
+        if settings.readiness_path:
+            write_readiness(settings.readiness_path, release_id=settings.release_id, bot_id=me.id, bot_username=me.username, scheduler_ready=True, polling_ready=True)
+
+    dp.startup.register(mark_ready)
     try:
-        # Этот проект использует long polling.
-        # Если раньше для токена был установлен webhook, снимаем его.
         await bot.delete_webhook(drop_pending_updates=False)
-        await dp.start_polling(
-            bot,
-            allowed_updates=dp.resolve_used_update_types(),
-        )
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        clear_readiness(settings.readiness_path)
         scheduler.shutdown()
         await runtime.close()
         await db.close()
@@ -139,4 +141,16 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--validate-release", action="store_true")
+    parser.add_argument("--migrate-only", action="store_true")
+    args = parser.parse_args()
+    if args.validate_release and args.migrate_only:
+        parser.error("choose one special mode")
+    if args.validate_release:
+        asyncio.run(validate_release())
+    elif args.migrate_only:
+        applied = asyncio.run(migrate_only())
+        print("MIGRATIONS_APPLIED=" + ",".join(map(str, applied)))
+    else:
+        asyncio.run(main())
