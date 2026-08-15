@@ -68,7 +68,7 @@ jobs:
       - name: Deploy release and collect diagnostics
         run: |
           RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-${GITHUB_SHA::12}"
-          gcloud compute ssh "${VM_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet --command="bash /tmp/deploy_release.sh /tmp/telegram-bot-deploy.tar.gz ${RELEASE_ID} ${GITHUB_SHA}" || {
+          gcloud compute ssh "${VM_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet --command="sudo -H -u takrillions bash /tmp/deploy_release.sh /tmp/telegram-bot-deploy.tar.gz ${RELEASE_ID} ${GITHUB_SHA}" || {
             gcloud compute ssh "${VM_NAME}" --project="${PROJECT_ID}" --zone="${ZONE}" --tunnel-through-iap --quiet --command='sudo journalctl -u telegram-bot -n 100 --no-pager' || true
             exit 1
           }
