@@ -219,3 +219,14 @@ __marimo__/
 
 # Local SQLite migration backups
 backups/
+
+# Local project notes and review artifacts
+stage1-review.zip
+stage1.diff
+
+# Local project notes and review artifacts
+/Задача.txt
+/Правки и Улучшения.txt
+/TG Bot (Ссылки).txt
+/stage1-review.zip
+/stage1.diff
