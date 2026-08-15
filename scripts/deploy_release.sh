@@ -15,6 +15,8 @@ LOCK="$SHARED/deploy.lock"
 READY="$SHARED/runtime/readiness.json"
 ENV_FILE="$SHARED/.env"
 RUNTIME_ENV="$SHARED/runtime/release.env"
+LEGACY_UNIT="$SHARED/runtime/telegram-bot.service.legacy"
+READINESS_ATTEMPTS=120
 
 mkdir -p "$RELEASES" "$SHARED/runtime" "$SHARED/backups"
 exec 9>"$LOCK"
@@ -67,7 +69,19 @@ restore_previous_release() {
     return 0
   fi
 
-  echo "no previous release is available for automatic rollback" >&2
+  if [ -f "$LEGACY_UNIT" ]; then
+    echo "restoring legacy systemd service" >&2
+    sudo systemctl disable --now "$BACKUP_TIMER" >/dev/null 2>&1 || true
+    rm -f "$ROOT/current" "$READY" "$RUNTIME_ENV"
+    sudo install -m 0644 "$LEGACY_UNIT" "/etc/systemd/system/${SERVICE}.service" || return 1
+    sudo systemctl daemon-reload || return 1
+    sudo systemctl start "$SERVICE" || return 1
+    sudo systemctl is-active --quiet "$SERVICE" || return 1
+    echo "legacy service restored" >&2
+    return 0
+  fi
+
+  echo "no previous release or legacy service is available for automatic rollback" >&2
   return 1
 }
 
@@ -137,7 +151,7 @@ CURRENT_SWITCHED=1
 write_runtime_env "$RELEASE_ID"
 
 sudo systemctl start "$SERVICE"
-for _ in $(seq 1 30); do
+for _ in $(seq 1 "$READINESS_ATTEMPTS"); do
   if [ -f "$READY" ] && grep -Fq "\"release_id\": \"$RELEASE_ID\"" "$READY"; then
     break
   fi
