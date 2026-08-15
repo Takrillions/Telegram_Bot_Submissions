@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from database import (
+    CURRENT_SCHEMA_VERSION,
     DEFAULT_MIGRATIONS,
     Database,
     DatabaseBackupError,
@@ -76,7 +77,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             conn.close()
 
     async def test_empty_database_receives_baseline_schema(self) -> None:
-        db = Database(self.db_path)
+        db = Database(self.db_path, migrations=DEFAULT_MIGRATIONS[:1])
         await db.init()
         self.assertEqual(await self._migration_versions(), [1])
         tables = await db.conn.execute(
@@ -93,7 +94,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         await self._create_legacy_database()
         db = Database(self.db_path)
         await db.init()
-        self.assertEqual(await self._migration_versions(), [1])
+        self.assertEqual(await self._migration_versions(), list(range(1, CURRENT_SCHEMA_VERSION + 1)))
         await db.run_preflight()
         await db.close()
 
@@ -112,7 +113,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             "SELECT applied_at FROM schema_migrations WHERE version = 1"
         )
         self.assertEqual((await repeated_at.fetchone())["applied_at"], first_applied_at)
-        self.assertEqual(await self._migration_versions(), [1])
+        self.assertEqual(await self._migration_versions(), list(range(1, CURRENT_SCHEMA_VERSION + 1)))
         await second.close()
 
     async def test_failed_migration_rolls_back_and_is_not_recorded(self) -> None:
@@ -124,13 +125,13 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.db_path,
             migrations=(
                 *DEFAULT_MIGRATIONS,
-                Migration(2, "intentional_failure", fail_after_write),
+                Migration(CURRENT_SCHEMA_VERSION + 1, "intentional_failure", fail_after_write),
             ),
         )
         with self.assertRaisesRegex(RuntimeError, "intentional migration failure"):
             await db.init()
 
-        self.assertEqual(await self._migration_versions(), [1])
+        self.assertEqual(await self._migration_versions(), list(range(1, CURRENT_SCHEMA_VERSION + 1)))
         conn = sqlite3.connect(self.db_path)
         try:
             probe = conn.execute(
@@ -144,10 +145,10 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         await self._create_legacy_database(with_data=True)
         db = Database(self.db_path)
         await db.init()
-        tenant = await db.conn.execute("SELECT * FROM tenants WHERE owner_id = 1")
+        tenant = await db.conn.execute("SELECT * FROM channels WHERE owner_id = 1")
         user = await db.conn.execute("SELECT * FROM users WHERE user_id = 2")
-        topic = await db.conn.execute("SELECT * FROM topics WHERE owner_id = 1 AND user_id = 2")
-        notices = await db.conn.execute("SELECT COUNT(*) AS count FROM notification_log")
+        topic = await db.conn.execute("SELECT * FROM channel_topics WHERE channel_id = (SELECT channel_id FROM legacy_owner_channels WHERE owner_id = 1) AND user_id = 2")
+        notices = await db.conn.execute("SELECT COUNT(*) AS count FROM channel_notification_log")
         self.assertEqual((await tenant.fetchone())["group_title"], "Legacy group")
         self.assertEqual((await user.fetchone())["username"], "legacy_user")
         self.assertEqual((await topic.fetchone())["topic_id"], 17)
@@ -159,13 +160,13 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         await self._create_legacy_database(with_data=True)
         db = Database(self.db_path)
         await db.init()
-        await db.set_tenant_period(1, 31)
-        await db.advance_tenant_reset(
-            owner_id=1,
+        await db.set_channel_period(1, 31)
+        await db.advance_channel_reset(
+            channel_id=1,
             next_reset_at=datetime.now(timezone.utc),
         )
         notices = await db.conn.execute(
-            "SELECT COUNT(*) AS count FROM notification_log"
+            "SELECT COUNT(*) AS count FROM channel_notification_log"
         )
         self.assertEqual((await notices.fetchone())["count"], 1)
         await db.close()
@@ -179,7 +180,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
                 self.db_path,
                 migrations=(
                     Migration(1, "baseline", noop),
-                    Migration(3, "gap", noop),
+                    Migration(18, "gap", noop),
                 ),
             )
 
@@ -208,8 +209,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.db_path,
             migrations=(
                 *DEFAULT_MIGRATIONS,
-                Migration(2, "second", noop),
-                Migration(3, "third", noop),
+                Migration(CURRENT_SCHEMA_VERSION + 1, "third", noop),
             ),
         )
         with self.assertRaises(DatabaseMigrationError):
@@ -237,7 +237,6 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.db_path,
             migrations=(
                 *DEFAULT_MIGRATIONS,
-                Migration(2, "second", noop),
             ),
         )
         with self.assertRaises(DatabaseMigrationError):
@@ -314,7 +313,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         async def create_deferred_foreign_key_violation(conn) -> None:
             await conn.execute("PRAGMA defer_foreign_keys = ON")
             await conn.execute(
-                "INSERT INTO tenant_subscribers VALUES (?, ?, ?, ?)",
+                "INSERT INTO channel_subscribers VALUES (?, ?, ?, ?)",
                 (999, 888, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
             )
 
@@ -322,17 +321,17 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
             self.db_path,
             migrations=(
                 *DEFAULT_MIGRATIONS,
-                Migration(2, "deferred_foreign_key_violation", create_deferred_foreign_key_violation),
+                Migration(CURRENT_SCHEMA_VERSION + 1, "deferred_foreign_key_violation", create_deferred_foreign_key_violation),
             ),
         )
         with self.assertRaises(DatabasePreflightError):
             await db.init()
 
-        self.assertEqual(await self._migration_versions(), [1])
+        self.assertEqual(await self._migration_versions(), list(range(1, CURRENT_SCHEMA_VERSION + 1)))
         conn = sqlite3.connect(self.db_path)
         try:
             count = conn.execute(
-                "SELECT COUNT(*) FROM tenant_subscribers"
+                "SELECT COUNT(*) FROM channel_subscribers"
             ).fetchone()[0]
         finally:
             conn.close()
@@ -389,7 +388,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         upgraded = Database(
             self.db_path,
             backup_dir=self._backup_dir(),
-            migrations=(*DEFAULT_MIGRATIONS, Migration(2, "add_marker", add_marker)),
+            migrations=(*DEFAULT_MIGRATIONS, Migration(CURRENT_SCHEMA_VERSION + 1, "add_marker", add_marker)),
         )
         await upgraded.init()
         backups = self._backup_files()
@@ -493,17 +492,17 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         async def rename_group(conn) -> None:
             await conn.execute(
-                "UPDATE tenants SET group_title = 'Migrated group' WHERE owner_id = 1"
+                "UPDATE channels SET group_title = 'Migrated group' WHERE owner_id = 1"
             )
 
         upgraded = Database(
             self.db_path,
             backup_dir=self._backup_dir(),
-            migrations=(*DEFAULT_MIGRATIONS, Migration(2, "rename_group", rename_group)),
+            migrations=(*DEFAULT_MIGRATIONS, Migration(CURRENT_SCHEMA_VERSION + 1, "rename_group", rename_group)),
         )
         await upgraded.init()
         current = await upgraded.conn.execute(
-            "SELECT group_title FROM tenants WHERE owner_id = 1"
+            "SELECT group_title FROM channels WHERE owner_id = 1"
         )
         self.assertEqual((await current.fetchone())["group_title"], "Migrated group")
         await upgraded.close()
@@ -511,7 +510,7 @@ class DatabaseMigrationTests(unittest.IsolatedAsyncioTestCase):
         backup = sqlite3.connect(self._backup_files()[0])
         try:
             self.assertEqual(
-                backup.execute("SELECT group_title FROM tenants WHERE owner_id = 1").fetchone()[0],
+                backup.execute("SELECT group_title FROM channels WHERE owner_id = 1").fetchone()[0],
                 "Legacy group",
             )
             self.assertEqual(backup.execute("PRAGMA integrity_check").fetchone()[0], "ok")

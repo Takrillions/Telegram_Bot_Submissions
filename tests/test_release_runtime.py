@@ -1,5 +1,3 @@
-import asyncio
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,18 +18,18 @@ class ReleaseRuntimeTests(unittest.IsolatedAsyncioTestCase):
         db = Database(self.db_path)
         await db.init(); await db.close()
         async def add_table(conn): await conn.execute("CREATE TABLE future_marker (id INTEGER)")
-        checked = Database(self.db_path, migrations=(*DEFAULT_MIGRATIONS, Migration(2, "future", add_table)))
+        checked = Database(self.db_path, migrations=(*DEFAULT_MIGRATIONS, Migration(CURRENT_SCHEMA_VERSION + 1, "future", add_table)))
         pending = await checked.inspect_pending_migrations()
-        self.assertEqual([item.version for item in pending], [2])
+        self.assertEqual([item.version for item in pending], [CURRENT_SCHEMA_VERSION + 1])
         self.assertFalse((self.root / "backups").exists())
 
     async def test_migrate_only_path_applies_pending_and_creates_backup(self):
         db = Database(self.db_path, backup_dir=self.root / "backups")
         await db.init(); await db.close()
         async def add_table(conn): await conn.execute("CREATE TABLE future_marker (id INTEGER)")
-        upgraded = Database(self.db_path, backup_dir=self.root / "backups", migrations=(*DEFAULT_MIGRATIONS, Migration(2, "future", add_table)))
+        upgraded = Database(self.db_path, backup_dir=self.root / "backups", migrations=(*DEFAULT_MIGRATIONS, Migration(CURRENT_SCHEMA_VERSION + 1, "future", add_table)))
         await upgraded.init()
-        self.assertEqual(upgraded.applied_migration_versions, (2,))
+        self.assertEqual(upgraded.applied_migration_versions, (CURRENT_SCHEMA_VERSION + 1,))
         self.assertEqual(len(list((self.root / "backups").glob("*.sqlite3"))), 1)
         await upgraded.close()
 

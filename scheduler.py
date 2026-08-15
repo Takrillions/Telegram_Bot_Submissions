@@ -16,7 +16,7 @@ from handlers import TopicCleaner
 logger = logging.getLogger(__name__)
 
 
-class TenantScheduler:
+class ChannelScheduler:
     """
     APScheduler запускает один асинхронный tick.
     Сами даты циклов хранятся в SQLite, поэтому перезапуск процесса
@@ -44,7 +44,7 @@ class TenantScheduler:
             self.tick,
             trigger="interval",
             seconds=self.check_seconds,
-            id="tenant_reset_tick",
+            id="channel_reset_tick",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -60,21 +60,24 @@ class TenantScheduler:
             return
 
         async with self._tick_lock:
-            tenants = await self.db.list_enabled_tenants()
+            channels = await self.db.list_enabled_channels()
             now = utc_now()
 
-            for tenant in tenants:
+            for channel in channels:
                 try:
-                    await self._process_tenant(tenant, now)
+                    await self._process_channel(channel, now)
                 except Exception:
                     logger.exception(
-                        "Ошибка scheduler tenant=%s",
-                        tenant["owner_id"],
+                        "Ошибка scheduler channel=%s",
+                        channel["channel_id"],
                     )
 
-    async def _process_tenant(self, tenant, now) -> None:
-        owner_id = int(tenant["owner_id"])
-        reset_at = dt_from_db(str(tenant["next_reset_at"]))
+    async def _process_channel(self, channel, now) -> None:
+        channel_id = int(channel["channel_id"])
+        if not bool(channel["auto_cleanup_enabled"]):
+            logger.debug("Automatic cleanup disabled for channel=%s", channel_id)
+            return
+        reset_at = dt_from_db(str(channel["next_reset_at"]))
         cycle_key = dt_to_db(reset_at)
 
         # В последние 24 часа каждый tick ищет только тех подписчиков,
@@ -83,7 +86,7 @@ class TenantScheduler:
         # 24-часового окна.
         if reset_at - timedelta(hours=24) <= now < reset_at:
             await self._broadcast_missing_notices(
-                tenant=tenant,
+                channel=channel,
                 cycle_key=cycle_key,
             )
 
@@ -91,29 +94,30 @@ class TenantScheduler:
             return
 
         logger.info(
-            "Авто-сброс tenant=%s cutoff=%s",
-            owner_id,
+            "Авто-сброс channel=%s cutoff=%s",
+            channel_id,
             cycle_key,
         )
 
         # Удаляем только темы, созданные ДО планового времени сброса.
         # Если scheduler сработал с небольшой задержкой и новая тема была
         # создана уже после reset_at, свежая тема не пострадает.
-        result = await self.cleaner.cleanup_created_before(
-            owner_id=owner_id,
+        result = await self.cleaner.cleanup_by_policy(
+            channel=channel,
             cutoff=reset_at,
+            now=now,
         )
 
         if result["failed"] > 0:
             logger.error(
-                "tenant=%s: %s тем не удалось удалить/закрыть; "
+                "channel=%s: %s тем не удалось удалить/закрыть; "
                 "сброс будет повторён следующим tick",
-                owner_id,
+                channel_id,
                 result["failed"],
             )
             return
 
-        interval_days = int(tenant["reset_interval_days"])
+        interval_days = int(channel["reset_interval_days"])
         next_reset = reset_at
 
         # Если процесс не работал несколько циклов, возвращаем расписание
@@ -121,31 +125,31 @@ class TenantScheduler:
         while next_reset <= now:
             next_reset += timedelta(days=interval_days)
 
-        await self.db.advance_tenant_reset(
-            owner_id=owner_id,
+        await self.db.advance_channel_reset(
+            channel_id=channel_id,
             next_reset_at=next_reset,
         )
 
         logger.info(
-            "tenant=%s: авто-сброс завершён; next_reset=%s",
-            owner_id,
+            "channel=%s: авто-сброс завершён; next_reset=%s",
+            channel_id,
             dt_to_db(next_reset),
         )
 
     async def _broadcast_missing_notices(
         self,
         *,
-        tenant,
+        channel,
         cycle_key: str,
     ) -> None:
-        owner_id = int(tenant["owner_id"])
-        text = str(tenant["notice_text"]).strip()
+        channel_id = int(channel["channel_id"])
+        text = str(channel["notice_text"]).strip()
 
         if not text:
             return
 
         user_ids = await self.db.get_unnotified_subscribers(
-            owner_id=owner_id,
+            channel_id=channel_id,
             cycle_at=cycle_key,
         )
 
@@ -153,8 +157,8 @@ class TenantScheduler:
             return
 
         logger.info(
-            "tenant=%s: предупреждение цикла %s, осталось %s пользователей",
-            owner_id,
+            "channel=%s: предупреждение цикла %s, осталось %s пользователей",
+            channel_id,
             cycle_key,
             len(user_ids),
         )
@@ -193,15 +197,15 @@ class TenantScheduler:
                     delivered_or_terminal = True
                 except TelegramBadRequest:
                     logger.warning(
-                        "tenant=%s: TelegramBadRequest notice user=%s",
-                        owner_id,
+                        "channel=%s: TelegramBadRequest notice user=%s",
+                        channel_id,
                         user_id,
                     )
                     delivered_or_terminal = True
                 except Exception:
                     logger.exception(
-                        "tenant=%s: повторная отправка notice user=%s не удалась",
-                        owner_id,
+                        "channel=%s: повторная отправка notice user=%s не удалась",
+                        channel_id,
                         user_id,
                     )
 
@@ -213,8 +217,8 @@ class TenantScheduler:
 
             except TelegramBadRequest:
                 logger.warning(
-                    "tenant=%s: TelegramBadRequest notice user=%s",
-                    owner_id,
+                    "channel=%s: TelegramBadRequest notice user=%s",
+                    channel_id,
                     user_id,
                 )
                 delivered_or_terminal = True
@@ -223,14 +227,14 @@ class TenantScheduler:
                 # Сетевые/временные ошибки не помечаем как доставленные:
                 # следующий scheduler tick попробует ещё раз.
                 logger.exception(
-                    "tenant=%s: временная ошибка notice user=%s",
-                    owner_id,
+                    "channel=%s: временная ошибка notice user=%s",
+                    channel_id,
                     user_id,
                 )
 
             if delivered_or_terminal:
                 await self.db.mark_notification_sent(
-                    owner_id=owner_id,
+                    channel_id=channel_id,
                     cycle_at=cycle_key,
                     user_id=user_id,
                 )

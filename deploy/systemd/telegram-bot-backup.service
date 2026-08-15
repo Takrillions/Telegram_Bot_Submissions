@@ -1,0 +1,13 @@
+[Unit]
+Description=Telegram Bot verified remote SQLite backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=takrillions
+Group=takrillions
+WorkingDirectory=/home/takrillions/telegram-bot/current
+EnvironmentFile=/home/takrillions/telegram-bot/shared/.env
+ExecStart=/home/takrillions/telegram-bot/current/.venv/bin/python /home/takrillions/telegram-bot/current/backup_runtime.py --label daily --remote-required
+UMask=0077

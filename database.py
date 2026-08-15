@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import sqlite3
@@ -8,6 +9,8 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
+from statistics import median
 
 import aiosqlite
 
@@ -279,11 +282,500 @@ async def apply_legacy_schema(conn: aiosqlite.Connection) -> None:
         await conn.execute(statement)
 
 
+CHANNEL_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE channels (
+        channel_id INTEGER PRIMARY KEY,
+        owner_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL UNIQUE,
+        group_title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        reset_interval_days INTEGER NOT NULL DEFAULT 30,
+        notice_text TEXT NOT NULL,
+        timezone_name TEXT NOT NULL,
+        next_reset_at TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        auto_cleanup_enabled INTEGER NOT NULL DEFAULT 1,
+        anonymous_prefix TEXT NOT NULL DEFAULT '\u0410\u043d\u043e\u043d'
+    )
+    """,
+    """CREATE TABLE legacy_owner_channels (
+        owner_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL UNIQUE,
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE channel_anonymous_counters (
+        channel_id INTEGER PRIMARY KEY,
+        next_number INTEGER NOT NULL DEFAULT 1 CHECK (next_number >= 1),
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE channel_subscribers (
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, user_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX idx_channel_subscribers_channel ON channel_subscribers(channel_id)",
+    """CREATE TABLE active_channel (
+        user_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        selected_at TEXT NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""",
+    """CREATE TABLE channel_topics (
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        topic_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, user_id),
+        UNIQUE (group_id, topic_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""",
+    "CREATE INDEX idx_channel_topics_channel_created ON channel_topics(channel_id, created_at)",
+    "CREATE INDEX idx_channel_topics_group_topic ON channel_topics(group_id, topic_id)",
+    """CREATE TABLE channel_notification_log (
+        channel_id INTEGER NOT NULL,
+        cycle_at TEXT NOT NULL,
+        user_id INTEGER NOT NULL,
+        sent_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, cycle_at, user_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""",
+)
+
+async def apply_channel_model(conn: aiosqlite.Connection) -> None:
+    # Every join is keyed by the immutable legacy owner_id; channel ids are never
+    # inferred from row order.
+    await conn.execute("ALTER TABLE tenants RENAME TO legacy_tenants")
+    await conn.execute("ALTER TABLE tenant_subscribers RENAME TO legacy_tenant_subscribers")
+    await conn.execute("ALTER TABLE active_tenant RENAME TO legacy_active_tenant")
+    await conn.execute("ALTER TABLE topics RENAME TO legacy_topics")
+    await conn.execute("ALTER TABLE notification_log RENAME TO legacy_notification_log")
+    for statement in CHANNEL_SCHEMA_STATEMENTS:
+        await conn.execute(statement)
+    await conn.execute("""INSERT INTO channels (owner_id, group_id, group_title, created_at, updated_at, reset_interval_days, notice_text, timezone_name, next_reset_at, enabled, auto_cleanup_enabled, anonymous_prefix)
+        SELECT owner_id, group_id, group_title, created_at, updated_at, reset_interval_days, notice_text, timezone_name, next_reset_at, enabled, 1, '\u0410\u043d\u043e\u043d'
+        FROM legacy_tenants ORDER BY owner_id""")
+    await conn.execute("""INSERT INTO legacy_owner_channels (owner_id, channel_id)
+        SELECT l.owner_id, c.channel_id FROM legacy_tenants l JOIN channels c ON c.group_id=l.group_id ORDER BY l.owner_id""")
+    await conn.execute("INSERT INTO channel_anonymous_counters (channel_id, next_number) SELECT channel_id, 1 FROM channels")
+    await conn.execute("""INSERT INTO channel_subscribers SELECT m.channel_id, s.user_id, s.first_seen_at, s.last_seen_at FROM legacy_tenant_subscribers s JOIN legacy_owner_channels m ON m.owner_id=s.owner_id""")
+    await conn.execute("""INSERT INTO active_channel SELECT a.user_id, m.channel_id, a.selected_at FROM legacy_active_tenant a JOIN legacy_owner_channels m ON m.owner_id=a.owner_id""")
+    await conn.execute("""INSERT INTO channel_topics SELECT m.channel_id, t.user_id, t.group_id, t.topic_id, t.created_at, t.last_activity_at FROM legacy_topics t JOIN legacy_owner_channels m ON m.owner_id=t.owner_id""")
+    await conn.execute("""INSERT INTO channel_notification_log SELECT m.channel_id, n.cycle_at, n.user_id, n.sent_at FROM legacy_notification_log n JOIN legacy_owner_channels m ON m.owner_id=n.owner_id""")
+    for old, new in (("legacy_tenant_subscribers", "channel_subscribers"), ("legacy_active_tenant", "active_channel"), ("legacy_topics", "channel_topics"), ("legacy_notification_log", "channel_notification_log")):
+        a = (await (await conn.execute(f"SELECT COUNT(*) FROM {old}")).fetchone())[0]
+        b = (await (await conn.execute(f"SELECT COUNT(*) FROM {new}")).fetchone())[0]
+        if a != b: raise DatabaseMigrationError(f"Channel migration lost rows from {old}")
+    await conn.execute("DROP TABLE legacy_tenant_subscribers")
+    await conn.execute("DROP TABLE legacy_active_tenant")
+    await conn.execute("DROP TABLE legacy_topics")
+    await conn.execute("DROP TABLE legacy_notification_log")
+    await conn.execute("DROP TABLE legacy_tenants")
+
+
+async def apply_privacy_model(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channel_topics RENAME TO legacy_channel_topics")
+    await conn.execute("DROP INDEX IF EXISTS idx_channel_topics_channel_created")
+    await conn.execute("DROP INDEX IF EXISTS idx_channel_topics_group_topic")
+    await conn.execute("""CREATE TABLE channel_topics (
+        channel_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        privacy_mode TEXT NOT NULL CHECK (privacy_mode IN ('identified','anonymous')),
+        group_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL, last_activity_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id,user_id,privacy_mode), UNIQUE(group_id,topic_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_channel_topics_channel_created ON channel_topics(channel_id, created_at)")
+    await conn.execute("CREATE INDEX idx_channel_topics_group_topic ON channel_topics(group_id, topic_id)")
+    await conn.execute("""INSERT INTO channel_topics(channel_id,user_id,privacy_mode,group_id,topic_id,created_at,last_activity_at)
+        SELECT channel_id,user_id,'identified',group_id,topic_id,created_at,last_activity_at FROM legacy_channel_topics""")
+    await conn.execute("DROP TABLE legacy_channel_topics")
+    await conn.execute("""CREATE TABLE channel_subscriber_privacy (
+        channel_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+        privacy_mode TEXT NOT NULL CHECK (privacy_mode IN ('identified','anonymous')),
+        updated_at TEXT NOT NULL, PRIMARY KEY(channel_id,user_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("""CREATE TABLE anonymous_tags (
+        channel_id INTEGER NOT NULL, user_id INTEGER NOT NULL, cycle_key TEXT NOT NULL,
+        number INTEGER NOT NULL, tag TEXT NOT NULL, assigned_at TEXT NOT NULL,
+        PRIMARY KEY(channel_id,user_id,cycle_key), UNIQUE(channel_id,cycle_key,number),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+
+
+
+async def apply_message_event_log(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE message_events (
+        event_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        privacy_mode TEXT NOT NULL CHECK (privacy_mode IN ('identified','anonymous')),
+        direction TEXT NOT NULL CHECK (direction IN ('subscriber_to_admin','admin_to_subscriber')),
+        message_type TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        source_chat_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        admin_id INTEGER,
+        media_group_id TEXT,
+        UNIQUE(source_chat_id, source_message_id, direction),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_message_events_channel_time ON message_events(channel_id, occurred_at)")
+    await conn.execute("CREATE INDEX idx_message_events_channel_user_time ON message_events(channel_id, user_id, occurred_at)")
+
+
+
+async def apply_topic_statuses(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channel_topics ADD COLUMN status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new','in_progress','answered','closed'))")
+    await conn.execute("CREATE INDEX idx_channel_topics_channel_status ON channel_topics(channel_id, status)")
+
+
+async def apply_topic_cleanup_protection(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channel_topics ADD COLUMN is_important INTEGER NOT NULL DEFAULT 0 CHECK (is_important IN (0, 1))")
+    await conn.execute("ALTER TABLE channel_topics ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0 CHECK (is_pinned IN (0, 1))")
+    await conn.execute("CREATE INDEX idx_channel_topics_cleanup_eligibility ON channel_topics(channel_id, created_at, status, is_important, is_pinned)")
+
+
+async def apply_channel_cleanup_policy(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channels ADD COLUMN cleanup_basis TEXT NOT NULL DEFAULT 'created_at' CHECK (cleanup_basis IN ('created_at', 'last_activity_at'))")
+    await conn.execute("ALTER TABLE channels ADD COLUMN cleanup_status_scope TEXT NOT NULL DEFAULT 'all' CHECK (cleanup_status_scope IN ('all', 'answered_closed'))")
+    await conn.execute("ALTER TABLE channels ADD COLUMN cleanup_action TEXT NOT NULL DEFAULT 'delete' CHECK (cleanup_action IN ('delete', 'close', 'close_then_delete'))")
+    await conn.execute("ALTER TABLE channels ADD COLUMN cleanup_final_delete_days INTEGER NOT NULL DEFAULT 7 CHECK (cleanup_final_delete_days >= 1)")
+    await conn.execute("ALTER TABLE channel_topics ADD COLUMN auto_closed_at TEXT")
+    await conn.execute("CREATE INDEX idx_channel_topics_auto_closed ON channel_topics(channel_id, auto_closed_at)")
+
+
+async def apply_active_admin_channel(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE active_admin_channel (
+        owner_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        selected_at TEXT NOT NULL,
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_active_admin_channel_channel ON active_admin_channel(channel_id)")
+
+
+async def apply_channel_topic_templates(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channels ADD COLUMN identified_topic_template TEXT NOT NULL DEFAULT '{name} — {username}'")
+    await conn.execute("ALTER TABLE channels ADD COLUMN anonymous_topic_template TEXT NOT NULL DEFAULT '{anonymous_tag}'")
+
+
+async def apply_subscriber_moderation_state(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE channel_subscriber_moderation (
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        rate_limit_seconds INTEGER,
+        muted_until TEXT,
+        blocked_until TEXT,
+        permanently_blocked INTEGER NOT NULL DEFAULT 0 CHECK (permanently_blocked IN (0, 1)),
+        marked_spam INTEGER NOT NULL DEFAULT 0 CHECK (marked_spam IN (0, 1)),
+        internal_note TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (channel_id, user_id),
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+
+
+async def apply_moderation_log(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE moderation_log (
+        log_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        admin_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        reason TEXT,
+        expires_at TEXT,
+        details TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_moderation_log_channel_user_time ON moderation_log(channel_id,user_id,created_at)")
+
+
+SANCTION_REASON_CHOICES = ("spam", "flood", "insult", "rules", "advertising", "suspicious_activity", "other")
+SANCTION_REASON_LABELS = {"spam": "\u0421\u043f\u0430\u043c", "flood": "\u0424\u043b\u0443\u0434", "insult": "\u041e\u0441\u043a\u043e\u0440\u0431\u043b\u0435\u043d\u0438\u044f", "rules": "\u041d\u0430\u0440\u0443\u0448\u0435\u043d\u0438\u0435 \u043f\u0440\u0430\u0432\u0438\u043b", "advertising": "\u0420\u0435\u043a\u043b\u0430\u043c\u0430", "suspicious_activity": "\u041f\u043e\u0434\u043e\u0437\u0440\u0438\u0442\u0435\u043b\u044c\u043d\u0430\u044f \u0430\u043a\u0442\u0438\u0432\u043d\u043e\u0441\u0442\u044c"}
+
+async def apply_sanction_reasons(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE channel_subscriber_moderation ADD COLUMN sanction_reason TEXT")
+    await conn.execute("ALTER TABLE channel_subscriber_moderation ADD COLUMN show_reason_to_subscriber INTEGER NOT NULL DEFAULT 0 CHECK (show_reason_to_subscriber IN (0, 1))")
+    await conn.execute("ALTER TABLE moderation_log ADD COLUMN show_reason_to_subscriber INTEGER NOT NULL DEFAULT 0 CHECK (show_reason_to_subscriber IN (0, 1))")
+
+
+SANCTION_ACTIONS = ("rate_limit", "mute", "temporary_block", "permanent_block", "warning")
+
+
+async def apply_subscriber_sanctions(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE subscriber_sanctions (
+        sanction_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        action TEXT NOT NULL CHECK(action IN ('rate_limit','mute','temporary_block','permanent_block','warning')),
+        rate_limit_seconds INTEGER,
+        expires_at TEXT,
+        reason TEXT NOT NULL,
+        show_reason_to_subscriber INTEGER NOT NULL CHECK(show_reason_to_subscriber IN (0, 1)),
+        active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1)),
+        created_at TEXT NOT NULL,
+        revoked_at TEXT,
+        revoked_by INTEGER,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_subscriber_sanctions_active ON subscriber_sanctions(channel_id,user_id,active,action,expires_at)")
+    # Preserve currently stored legacy moderation state as independent sanctions.
+    rows = await (await conn.execute("SELECT * FROM channel_subscriber_moderation")).fetchall()
+    for row in rows:
+        reason = str(row["sanction_reason"] or "\\u041e\\u0433\\u0440\\u0430\\u043d\\u0438\\u0447\\u0435\\u043d\\u0438\\u0435")
+        visible = int(row["show_reason_to_subscriber"] or 0)
+        created = str(row["updated_at"])
+        if row["rate_limit_seconds"]:
+            expires = dt_to_db(dt_from_db(created) + timedelta(seconds=int(row["rate_limit_seconds"])))
+            await conn.execute("INSERT INTO subscriber_sanctions(channel_id,user_id,action,rate_limit_seconds,expires_at,reason,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?,?)", (row["channel_id"],row["user_id"],"rate_limit",row["rate_limit_seconds"],expires,reason,visible,created))
+        if row["muted_until"]:
+            await conn.execute("INSERT INTO subscriber_sanctions(channel_id,user_id,action,expires_at,reason,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)", (row["channel_id"],row["user_id"],"mute",row["muted_until"],reason,visible,created))
+        if row["blocked_until"]:
+            await conn.execute("INSERT INTO subscriber_sanctions(channel_id,user_id,action,expires_at,reason,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)", (row["channel_id"],row["user_id"],"temporary_block",row["blocked_until"],reason,visible,created))
+        if row["permanently_blocked"]:
+            await conn.execute("INSERT INTO subscriber_sanctions(channel_id,user_id,action,reason,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?)", (row["channel_id"],row["user_id"],"permanent_block",reason,visible,created))
+
+
+async def apply_subscriber_metadata(conn: aiosqlite.Connection) -> None:
+    """Store staff-only notes and tags independently for each channel subscriber."""
+    await conn.execute("""CREATE TABLE subscriber_notes (
+        note_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        admin_id INTEGER NOT NULL,
+        note_text TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_subscriber_notes_channel_user_time ON subscriber_notes(channel_id,user_id,created_at,note_id)")
+    await conn.execute("""CREATE TABLE subscriber_tags (
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        tag_key TEXT NOT NULL,
+        added_by INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(channel_id,user_id,tag_key),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_subscriber_tags_channel_tag ON subscriber_tags(channel_id,tag)")
+
+
+async def apply_subscriber_metadata_management(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE subscriber_notes ADD COLUMN updated_at TEXT")
+    await conn.execute("ALTER TABLE subscriber_notes ADD COLUMN updated_by INTEGER")
+    await conn.execute("ALTER TABLE subscriber_notes ADD COLUMN deleted_at TEXT")
+    await conn.execute("ALTER TABLE subscriber_notes ADD COLUMN deleted_by INTEGER")
+    await conn.execute("CREATE INDEX idx_subscriber_notes_active ON subscriber_notes(channel_id,user_id,deleted_at,note_id)")
+    # A stable integer identifier keeps callback data small and never exposes tag text.
+    await conn.execute("""CREATE TABLE subscriber_tags_new (
+        tag_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        tag TEXT NOT NULL,
+        tag_key TEXT NOT NULL,
+        added_by INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(channel_id,user_id,tag_key),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(user_id) REFERENCES users(user_id) ON DELETE CASCADE
+    )""")
+    # v14 did not enforce case-insensitive uniqueness at SQLite level. Keep one
+    # deterministic representative of any logically identical legacy tag.
+    await conn.execute("INSERT INTO subscriber_tags_new(channel_id,user_id,tag,tag_key,added_by,created_at) SELECT channel_id,user_id,MIN(tag),tag_key,MIN(added_by),MIN(created_at) FROM subscriber_tags GROUP BY channel_id,user_id,tag_key")
+    await conn.execute("DROP TABLE subscriber_tags")
+    await conn.execute("ALTER TABLE subscriber_tags_new RENAME TO subscriber_tags")
+    await conn.execute("CREATE INDEX idx_subscriber_tags_channel_tag ON subscriber_tags(channel_id,tag)")
+
+
+async def apply_subscriber_statistics_events(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE message_events ADD COLUMN conversation_id INTEGER")
+    await conn.execute("CREATE INDEX idx_message_events_subscriber_conversation ON message_events(channel_id,user_id,conversation_id,occurred_at)")
+
+
+async def apply_channel_template_overrides(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE channel_template_overrides (
+        channel_id INTEGER NOT NULL,
+        template_key TEXT NOT NULL,
+        custom_text TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL,
+        PRIMARY KEY(channel_id, template_key),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+
+
+async def apply_anonymous_cycle_state(conn: aiosqlite.Connection) -> None:
+    """Decouple anonymous numbering cycles from cleanup schedule edits."""
+    await conn.execute("ALTER TABLE channel_anonymous_counters RENAME TO legacy_channel_anonymous_counters")
+    await conn.execute("""CREATE TABLE channel_anonymous_counters (
+        channel_id INTEGER PRIMARY KEY,
+        next_number INTEGER NOT NULL DEFAULT 1 CHECK (next_number >= 1),
+        cycle_key TEXT NOT NULL,
+        FOREIGN KEY (channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("""INSERT INTO channel_anonymous_counters(channel_id,next_number,cycle_key)
+        SELECT old.channel_id, old.next_number, c.next_reset_at
+        FROM legacy_channel_anonymous_counters old
+        JOIN channels c ON c.channel_id=old.channel_id""")
+    await conn.execute("DROP TABLE legacy_channel_anonymous_counters")
+
+
+async def apply_bot_prestart_card(conn: aiosqlite.Connection) -> None:
+    """Persist the bot-wide pre-Start card draft without copying defaults."""
+    await conn.execute("""CREATE TABLE bot_prestart_card (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        description_override TEXT,
+        media_type TEXT CHECK (media_type IS NULL OR media_type IN ('photo','video','animation')),
+        media_file_id TEXT,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL,
+        CHECK ((media_type IS NULL AND media_file_id IS NULL) OR (media_type IS NOT NULL AND media_file_id IS NOT NULL))
+    )""")
+
+
+async def apply_reaction_routing(conn: aiosqlite.Connection) -> None:
+    """Persist per-channel reaction mode, source mapping and idempotency journals."""
+    await conn.execute("""CREATE TABLE channel_reaction_settings (
+        channel_id INTEGER PRIMARY KEY,
+        mode TEXT NOT NULL DEFAULT 'subscriber' CHECK (mode IN ('subscriber','service')),
+        service_topic_id INTEGER,
+        service_topic_name TEXT,
+        requires_repair INTEGER NOT NULL DEFAULT 0 CHECK (requires_repair IN (0,1)),
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("""CREATE TABLE channel_reaction_sources (
+        channel_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        forum_message_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        privacy_mode TEXT NOT NULL CHECK (privacy_mode IN ('identified','anonymous')),
+        private_chat_id INTEGER NOT NULL,
+        private_message_id INTEGER NOT NULL,
+        topic_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(group_id, forum_message_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_reaction_sources_channel_topic ON channel_reaction_sources(channel_id,topic_id)")
+    await conn.execute("""CREATE TABLE channel_reaction_events (
+        channel_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        reaction_key TEXT NOT NULL,
+        event_at TEXT NOT NULL,
+        mode TEXT NOT NULL CHECK (mode IN ('subscriber','service')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(channel_id,group_id,source_message_id,actor_id,reaction_key,event_at),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("""CREATE TABLE channel_reaction_dispatches (
+        channel_id INTEGER NOT NULL,
+        group_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        service_topic_id INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('sending','sent','error')),
+        triggered_by INTEGER NOT NULL,
+        reaction_key TEXT NOT NULL,
+        destination_message_id INTEGER,
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(channel_id,group_id,source_message_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+
+
+async def apply_broadcast_album_sources(conn: aiosqlite.Connection) -> None:
+    """Allow one broadcast draft to persist a complete Telegram media group."""
+    await conn.execute("ALTER TABLE channel_broadcasts ADD COLUMN source_message_ids TEXT")
+    await conn.execute("ALTER TABLE channel_broadcasts ADD COLUMN source_media_group_id TEXT")
+
+
+async def apply_mass_broadcasts(conn: aiosqlite.Connection) -> None:
+    """Persist idempotent per-channel mass broadcast state and delivery journal."""
+    await conn.execute("""CREATE TABLE channel_broadcasts (
+        broadcast_id TEXT PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        created_by INTEGER NOT NULL,
+        source_chat_id INTEGER NOT NULL,
+        source_message_id INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('draft','sending','completed','cancelled')),
+        recipient_count INTEGER NOT NULL DEFAULT 0 CHECK (recipient_count >= 0),
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE(broadcast_id, channel_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("""CREATE TABLE channel_broadcast_deliveries (
+        broadcast_id TEXT NOT NULL,
+        channel_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        privacy_mode TEXT CHECK (privacy_mode IS NULL OR privacy_mode IN ('identified','anonymous')),
+        topic_id INTEGER,
+        status TEXT NOT NULL CHECK (status IN ('pending','reserved','delivered','undelivered','error')),
+        error_code TEXT,
+        reserved_at TEXT,
+        completed_at TEXT,
+        PRIMARY KEY(broadcast_id, channel_id, user_id),
+        FOREIGN KEY(broadcast_id, channel_id) REFERENCES channel_broadcasts(broadcast_id, channel_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_broadcast_deliveries_status ON channel_broadcast_deliveries(broadcast_id,channel_id,status)")
+    await conn.execute("CREATE UNIQUE INDEX idx_one_sending_broadcast_per_channel ON channel_broadcasts(channel_id) WHERE status='sending'")
+
+
 DEFAULT_MIGRATIONS = (
     Migration(1, "baseline_legacy_schema", apply_legacy_schema),
+    Migration(2, "channel_model", apply_channel_model),
+    Migration(3, "subscriber_privacy", apply_privacy_model),
+    Migration(4, "message_event_log", apply_message_event_log),
+    Migration(5, "topic_statuses", apply_topic_statuses),
+    Migration(6, "topic_cleanup_protection", apply_topic_cleanup_protection),
+    Migration(7, "channel_cleanup_policy", apply_channel_cleanup_policy),
+    Migration(8, "active_admin_channel", apply_active_admin_channel),
+    Migration(9, "channel_topic_templates", apply_channel_topic_templates),
+    Migration(10, "subscriber_moderation_state", apply_subscriber_moderation_state),
+    Migration(11, "moderation_log", apply_moderation_log),
+    Migration(12, "sanction_reasons", apply_sanction_reasons),
+    Migration(13, "subscriber_sanctions", apply_subscriber_sanctions),
+    Migration(14, "subscriber_metadata", apply_subscriber_metadata),
+    Migration(15, "subscriber_metadata_management", apply_subscriber_metadata_management),
+    Migration(16, "subscriber_statistics_events", apply_subscriber_statistics_events),
+    Migration(17, "channel_template_overrides", apply_channel_template_overrides),
+    Migration(18, "anonymous_cycle_state", apply_anonymous_cycle_state),
+    Migration(19, "bot_prestart_card", apply_bot_prestart_card),
+    Migration(20, "mass_broadcasts", apply_mass_broadcasts),
+    Migration(21, "reaction_routing", apply_reaction_routing),
+    Migration(22, "broadcast_album_sources", apply_broadcast_album_sources),
 )
 CURRENT_SCHEMA_VERSION = DEFAULT_MIGRATIONS[-1].version
-
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -647,543 +1139,1477 @@ class Database:
             self._conn = None
 
     # ------------------------------------------------------------------
-    # Tenants
+    # Per-channel UI template overrides. Defaults live in templates.py and are
+    # never copied to the database.
     # ------------------------------------------------------------------
+    async def get_template_override(self, *, channel_id: int, template_key: str) -> str | None:
+        row = await (await self.conn.execute("SELECT custom_text FROM channel_template_overrides WHERE channel_id=? AND template_key=?", (channel_id, template_key))).fetchone()
+        return None if row is None else str(row["custom_text"])
 
-    async def register_tenant(
-        self,
-        *,
-        owner_id: int,
-        group_id: int,
-        group_title: str,
-        default_reset_days: int,
-        default_notice_text: str,
-        default_timezone: str,
-    ) -> tuple[str, sqlite3.Row | None]:
-        """
-        Один owner_id может владеть одной супергруппой.
-        Одна супергруппа может принадлежать только одному owner_id.
-
-        Возвращает:
-        - "created"
-        - "existing"
-        - "owner_has_other_group"
-        - "group_has_other_owner"
-        """
-        now = utc_now()
-
+    async def set_template_override(self, *, channel_id: int, template_key: str, custom_text: str, updated_by: int) -> None:
         async with self._write_lock:
-            by_group_cursor = await self.conn.execute(
-                "SELECT * FROM tenants WHERE group_id = ?",
-                (group_id,),
+            await self.conn.execute("INSERT INTO channel_template_overrides(channel_id,template_key,custom_text,updated_at,updated_by) VALUES(?,?,?,?,?) ON CONFLICT(channel_id,template_key) DO UPDATE SET custom_text=excluded.custom_text,updated_at=excluded.updated_at,updated_by=excluded.updated_by", (channel_id, template_key, custom_text, dt_to_db(utc_now()), updated_by))
+            await self.conn.commit()
+
+    async def reset_template_override(self, *, channel_id: int, template_key: str) -> bool:
+        async with self._write_lock:
+            cursor = await self.conn.execute("DELETE FROM channel_template_overrides WHERE channel_id=? AND template_key=?", (channel_id, template_key))
+            await self.conn.commit()
+            return cursor.rowcount > 0
+
+    async def reset_all_template_overrides(self, *, channel_id: int) -> int:
+        async with self._write_lock:
+            cursor = await self.conn.execute("DELETE FROM channel_template_overrides WHERE channel_id=?", (channel_id,))
+            await self.conn.commit()
+            return cursor.rowcount
+
+    async def list_template_override_keys(self, *, channel_id: int) -> set[str]:
+        rows = await (await self.conn.execute("SELECT template_key FROM channel_template_overrides WHERE channel_id=? ORDER BY template_key", (channel_id,))).fetchall()
+        return {str(row["template_key"]) for row in rows}
+
+    # ------------------------------------------------------------------
+    # Global pre-Start bot card. The Telegram description is bot-wide, so the
+    # persisted draft is intentionally not keyed by channel_id.
+    # ------------------------------------------------------------------
+    async def get_bot_prestart_card(self) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM bot_prestart_card WHERE singleton_id=1"
+        )).fetchone()
+
+    async def set_bot_prestart_description(self, *, description: str | None, updated_by: int) -> None:
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT INTO bot_prestart_card(singleton_id,description_override,media_type,media_file_id,updated_at,updated_by)
+                   VALUES(1,?,NULL,NULL,?,?)
+                   ON CONFLICT(singleton_id) DO UPDATE SET
+                     description_override=excluded.description_override,
+                     updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                (description, dt_to_db(utc_now()), updated_by),
             )
-            by_group = await by_group_cursor.fetchone()
+            await self.conn.commit()
 
-            if by_group is not None and int(by_group["owner_id"]) != owner_id:
-                return "group_has_other_owner", by_group
-
-            by_owner_cursor = await self.conn.execute(
-                "SELECT * FROM tenants WHERE owner_id = ?",
-                (owner_id,),
+    async def set_bot_prestart_media(self, *, media_type: str, media_file_id: str, updated_by: int) -> None:
+        if media_type not in {"photo", "video", "animation"} or not media_file_id:
+            raise ValueError("Unsupported pre-start media")
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT INTO bot_prestart_card(singleton_id,description_override,media_type,media_file_id,updated_at,updated_by)
+                   VALUES(1,NULL,?,?,?,?)
+                   ON CONFLICT(singleton_id) DO UPDATE SET
+                     media_type=excluded.media_type, media_file_id=excluded.media_file_id,
+                     updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
+                (media_type, media_file_id, dt_to_db(utc_now()), updated_by),
             )
-            by_owner = await by_owner_cursor.fetchone()
+            await self.conn.commit()
 
-            if by_owner is not None and int(by_owner["group_id"]) != group_id:
-                return "owner_has_other_group", by_owner
-
-            if by_owner is not None:
+    async def remove_bot_prestart_media(self, *, updated_by: int) -> None:
+        async with self._write_lock:
+            row = await (await self.conn.execute(
+                "SELECT description_override FROM bot_prestart_card WHERE singleton_id=1"
+            )).fetchone()
+            if row is None:
+                return
+            if row["description_override"] is None:
+                await self.conn.execute("DELETE FROM bot_prestart_card WHERE singleton_id=1")
+            else:
                 await self.conn.execute(
-                    """
-                    UPDATE tenants
-                    SET group_title = ?, updated_at = ?, enabled = 1
-                    WHERE owner_id = ?
-                    """,
-                    (group_title, dt_to_db(now), owner_id),
+                    "UPDATE bot_prestart_card SET media_type=NULL,media_file_id=NULL,updated_at=?,updated_by=? WHERE singleton_id=1",
+                    (dt_to_db(utc_now()), updated_by),
                 )
-                await self.conn.commit()
-
-                cursor = await self.conn.execute(
-                    "SELECT * FROM tenants WHERE owner_id = ?",
-                    (owner_id,),
-                )
-                return "existing", await cursor.fetchone()
-
-            next_reset = now + timedelta(days=default_reset_days)
-
-            await self.conn.execute(
-                """
-                INSERT INTO tenants (
-                    owner_id,
-                    group_id,
-                    group_title,
-                    created_at,
-                    updated_at,
-                    reset_interval_days,
-                    notice_text,
-                    timezone_name,
-                    next_reset_at,
-                    enabled
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    owner_id,
-                    group_id,
-                    group_title,
-                    dt_to_db(now),
-                    dt_to_db(now),
-                    default_reset_days,
-                    default_notice_text,
-                    default_timezone,
-                    dt_to_db(next_reset),
-                ),
-            )
             await self.conn.commit()
 
-            cursor = await self.conn.execute(
-                "SELECT * FROM tenants WHERE owner_id = ?",
-                (owner_id,),
-            )
-            return "created", await cursor.fetchone()
+    async def reset_bot_prestart_card(self) -> None:
+        async with self._write_lock:
+            await self.conn.execute("DELETE FROM bot_prestart_card WHERE singleton_id=1")
+            await self.conn.commit()
 
-    async def get_tenant_by_owner(
-        self, owner_id: int
-    ) -> sqlite3.Row | None:
-        cursor = await self.conn.execute(
-            "SELECT * FROM tenants WHERE owner_id = ? AND enabled = 1",
-            (owner_id,),
-        )
-        return await cursor.fetchone()
+    # ------------------------------------------------------------------
+    # Channel mass broadcasts.  The delivery journal is keyed by real user,
+    # never by topic, so anonymous/identified topic pairs cannot duplicate a
+    # publication.  No identity from this layer is exposed to Telegram UI.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_broadcast_source_ids(source_message_id: int, source_message_ids: Sequence[int] | None) -> tuple[int, ...]:
+        values = tuple(int(value) for value in (source_message_ids or (source_message_id,)))
+        if not values or len(values) > 100 or any(value <= 0 for value in values):
+            raise ValueError("Invalid broadcast source message ids")
+        ordered = tuple(sorted(set(values)))
+        if len(ordered) != len(values):
+            raise ValueError("Broadcast source message ids must be unique")
+        return ordered
 
-    async def get_tenant_by_group(
-        self, group_id: int
-    ) -> sqlite3.Row | None:
-        cursor = await self.conn.execute(
-            "SELECT * FROM tenants WHERE group_id = ? AND enabled = 1",
-            (group_id,),
-        )
-        return await cursor.fetchone()
-
-    async def list_enabled_tenants(self) -> list[sqlite3.Row]:
-        cursor = await self.conn.execute(
-            """
-            SELECT *
-            FROM tenants
-            WHERE enabled = 1
-            ORDER BY owner_id
-            """
-        )
-        return await cursor.fetchall()
-
-    async def set_tenant_period(
-        self,
-        owner_id: int,
-        days: int,
-    ) -> datetime:
-        if days < 2:
-            raise ValueError("Период должен быть не меньше 2 дней")
-
-        next_reset = utc_now() + timedelta(days=days)
-
+    async def create_broadcast_draft(
+        self, *, channel_id: int, created_by: int, source_chat_id: int, source_message_id: int,
+        source_message_ids: Sequence[int] | None = None, source_media_group_id: str | None = None,
+    ) -> sqlite3.Row:
+        broadcast_id = uuid.uuid4().hex
+        now = dt_to_db(utc_now())
+        source_ids = self._normalize_broadcast_source_ids(source_message_id, source_message_ids)
         async with self._write_lock:
             await self.conn.execute(
-                """
-                UPDATE tenants
-                SET reset_interval_days = ?,
-                    next_reset_at = ?,
-                    updated_at = ?
-                WHERE owner_id = ?
-                """,
-                (
-                    days,
-                    dt_to_db(next_reset),
-                    dt_to_db(utc_now()),
-                    owner_id,
-                ),
+                "INSERT INTO channel_broadcasts(broadcast_id,channel_id,created_by,source_chat_id,source_message_id,source_message_ids,source_media_group_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'draft',?,?)",
+                (broadcast_id, channel_id, created_by, source_chat_id, source_ids[0], json.dumps(source_ids), source_media_group_id, now, now),
+            )
+            await self.conn.commit()
+        row = await self.get_broadcast(broadcast_id=broadcast_id, channel_id=channel_id)
+        if row is None:
+            raise RuntimeError("Broadcast draft was not created")
+        return row
+
+    async def update_broadcast_draft_source(
+        self, *, broadcast_id: str, channel_id: int, created_by: int, source_chat_id: int, source_message_id: int,
+        source_message_ids: Sequence[int] | None = None, source_media_group_id: str | None = None,
+    ) -> bool:
+        source_ids = self._normalize_broadcast_source_ids(source_message_id, source_message_ids)
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_broadcasts SET source_chat_id=?,source_message_id=?,source_message_ids=?,source_media_group_id=?,updated_at=? WHERE broadcast_id=? AND channel_id=? AND created_by=? AND status='draft'",
+                (source_chat_id, source_ids[0], json.dumps(source_ids), source_media_group_id, dt_to_db(utc_now()), broadcast_id, channel_id, created_by),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def broadcast_source_message_ids(broadcast: sqlite3.Row) -> tuple[int, ...]:
+        raw = broadcast["source_message_ids"] if "source_message_ids" in broadcast.keys() else None
+        if raw:
+            try:
+                values = tuple(int(value) for value in json.loads(str(raw)))
+                if values and values == tuple(sorted(set(values))):
+                    return values
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning("Invalid stored source_message_ids for broadcast %s", broadcast["broadcast_id"])
+        return (int(broadcast["source_message_id"]),)
+
+    async def get_broadcast(self, *, broadcast_id: str, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_broadcasts WHERE broadcast_id=? AND channel_id=?",
+            (broadcast_id, channel_id),
+        )).fetchone()
+
+    async def get_sending_broadcast(self, *, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_broadcasts WHERE channel_id=? AND status='sending' ORDER BY started_at DESC LIMIT 1",
+            (channel_id,),
+        )).fetchone()
+
+    async def cancel_broadcast_draft(self, *, broadcast_id: str, channel_id: int, created_by: int) -> bool:
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_broadcasts SET status='cancelled',updated_at=? WHERE broadcast_id=? AND channel_id=? AND created_by=? AND status='draft'",
+                (dt_to_db(utc_now()), broadcast_id, channel_id, created_by),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def claim_broadcast_for_send(self, *, broadcast_id: str, channel_id: int, created_by: int) -> bool:
+        """Atomically claim a draft and snapshot unique recipient user IDs."""
+        now = dt_to_db(utc_now())
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = await (await self.conn.execute(
+                    "SELECT status,created_by FROM channel_broadcasts WHERE broadcast_id=? AND channel_id=?",
+                    (broadcast_id, channel_id),
+                )).fetchone()
+                if row is None or str(row["status"]) != "draft" or int(row["created_by"]) != created_by:
+                    await self.conn.rollback()
+                    return False
+                other = await (await self.conn.execute(
+                    "SELECT 1 FROM channel_broadcasts WHERE channel_id=? AND status='sending' AND broadcast_id!=?",
+                    (channel_id, broadcast_id),
+                )).fetchone()
+                if other is not None:
+                    await self.conn.rollback()
+                    return False
+
+                recipients = await (await self.conn.execute(
+                    """SELECT DISTINCT s.user_id
+                       FROM channel_subscribers s
+                       WHERE s.channel_id=? AND (
+                           EXISTS (SELECT 1 FROM channel_topics t WHERE t.channel_id=s.channel_id AND t.user_id=s.user_id)
+                           OR EXISTS (SELECT 1 FROM message_events e WHERE e.channel_id=s.channel_id AND e.user_id=s.user_id)
+                       )
+                       ORDER BY s.user_id""",
+                    (channel_id,),
+                )).fetchall()
+                await self.conn.execute(
+                    "UPDATE channel_broadcasts SET status='sending',recipient_count=?,started_at=?,updated_at=? WHERE broadcast_id=? AND channel_id=?",
+                    (len(recipients), now, now, broadcast_id, channel_id),
+                )
+                if recipients:
+                    await self.conn.executemany(
+                        "INSERT INTO channel_broadcast_deliveries(broadcast_id,channel_id,user_id,status) VALUES(?,?,?,'pending')",
+                        [(broadcast_id, channel_id, int(item["user_id"])) for item in recipients],
+                    )
+                await self.conn.commit()
+                return True
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def list_pending_broadcast_deliveries(self, *, broadcast_id: str, channel_id: int) -> list[sqlite3.Row]:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_broadcast_deliveries WHERE broadcast_id=? AND channel_id=? AND status='pending' ORDER BY user_id",
+            (broadcast_id, channel_id),
+        )).fetchall()
+
+    async def reserve_broadcast_delivery(self, *, broadcast_id: str, channel_id: int, user_id: int) -> dict[str, object] | None:
+        """Reserve one recipient and resolve only their current privacy/topic route."""
+        async with self._write_lock:
+            pending = await (await self.conn.execute(
+                "SELECT 1 FROM channel_broadcast_deliveries WHERE broadcast_id=? AND channel_id=? AND user_id=? AND status='pending'",
+                (broadcast_id, channel_id, user_id),
+            )).fetchone()
+            if pending is None:
+                return None
+            route = await (await self.conn.execute(
+                """SELECT COALESCE(p.privacy_mode,'identified') AS privacy_mode,
+                          t.group_id, t.topic_id, t.status AS topic_status
+                   FROM channel_subscribers s
+                   LEFT JOIN channel_subscriber_privacy p ON p.channel_id=s.channel_id AND p.user_id=s.user_id
+                   LEFT JOIN channel_topics t ON t.channel_id=s.channel_id AND t.user_id=s.user_id
+                        AND t.privacy_mode=COALESCE(p.privacy_mode,'identified')
+                   WHERE s.channel_id=? AND s.user_id=?""",
+                (channel_id, user_id),
+            )).fetchone()
+            privacy_mode = str(route["privacy_mode"]) if route is not None else "identified"
+            topic_id = int(route["topic_id"]) if route is not None and route["topic_id"] is not None else None
+            cursor = await self.conn.execute(
+                "UPDATE channel_broadcast_deliveries SET privacy_mode=?,topic_id=?,status='reserved',reserved_at=? WHERE broadcast_id=? AND channel_id=? AND user_id=? AND status='pending'",
+                (privacy_mode, topic_id, dt_to_db(utc_now()), broadcast_id, channel_id, user_id),
+            )
+            if cursor.rowcount != 1:
+                await self.conn.rollback()
+                return None
+            await self.conn.commit()
+            return {
+                "privacy_mode": privacy_mode,
+                "group_id": int(route["group_id"]) if route is not None and route["group_id"] is not None else None,
+                "topic_id": topic_id,
+                "topic_status": str(route["topic_status"]) if route is not None and route["topic_status"] is not None else None,
+            }
+
+    async def complete_broadcast_delivery(self, *, broadcast_id: str, channel_id: int, user_id: int, status: str, error_code: str | None = None) -> bool:
+        if status not in {"delivered", "undelivered", "error"}:
+            raise ValueError("Invalid broadcast delivery status")
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_broadcast_deliveries SET status=?,error_code=?,completed_at=? WHERE broadcast_id=? AND channel_id=? AND user_id=? AND status='reserved'",
+                (status, error_code, dt_to_db(utc_now()), broadcast_id, channel_id, user_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def finish_broadcast(self, *, broadcast_id: str, channel_id: int) -> bool:
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_broadcasts SET status='completed',completed_at=?,updated_at=? WHERE broadcast_id=? AND channel_id=? AND status='sending'",
+                (dt_to_db(utc_now()), dt_to_db(utc_now()), broadcast_id, channel_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def get_broadcast_delivery_summary(self, *, broadcast_id: str, channel_id: int) -> dict[str, int]:
+        broadcast = await self.get_broadcast(broadcast_id=broadcast_id, channel_id=channel_id)
+        if broadcast is None:
+            raise ValueError("Unknown broadcast")
+        rows = await (await self.conn.execute(
+            "SELECT status,COUNT(*) AS count FROM channel_broadcast_deliveries WHERE broadcast_id=? AND channel_id=? GROUP BY status",
+            (broadcast_id, channel_id),
+        )).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        return {
+            "unique_recipients": int(broadcast["recipient_count"]),
+            "delivered": counts.get("delivered", 0),
+            "undelivered": counts.get("undelivered", 0),
+            "errors": counts.get("error", 0),
+            "skipped": counts.get("reserved", 0) + counts.get("pending", 0),
+        }
+
+    # ------------------------------------------------------------------
+    # Administrator reaction routing. Source mappings are created only for
+    # subscriber messages copied into user topics, never for cards/admin text.
+    # ------------------------------------------------------------------
+    async def get_channel_reaction_settings(self, channel_id: int) -> dict[str, object]:
+        row = await (await self.conn.execute(
+            "SELECT * FROM channel_reaction_settings WHERE channel_id=?", (channel_id,)
+        )).fetchone()
+        if row is None:
+            return {
+                "channel_id": channel_id, "mode": "subscriber", "service_topic_id": None,
+                "service_topic_name": None, "requires_repair": False,
+            }
+        return {
+            "channel_id": int(row["channel_id"]),
+            "mode": str(row["mode"]),
+            "service_topic_id": int(row["service_topic_id"]) if row["service_topic_id"] is not None else None,
+            "service_topic_name": str(row["service_topic_name"]) if row["service_topic_name"] is not None else None,
+            "requires_repair": bool(row["requires_repair"]),
+        }
+
+    async def set_channel_reaction_mode(self, *, channel_id: int, mode: str, updated_by: int) -> None:
+        if mode not in {"subscriber", "service"}:
+            raise ValueError("Invalid reaction mode")
+        current = await self.get_channel_reaction_settings(channel_id)
+        if mode == "service" and (current["service_topic_id"] is None or bool(current["requires_repair"])):
+            raise ValueError("Service reaction topic is not ready")
+        now = dt_to_db(utc_now())
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT INTO channel_reaction_settings(channel_id,mode,updated_at,updated_by) VALUES(?,?,?,?)
+                   ON CONFLICT(channel_id) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+                (channel_id, mode, now, updated_by),
             )
             await self.conn.commit()
 
+    async def set_reaction_service_topic(self, *, channel_id: int, topic_id: int, topic_name: str, updated_by: int, activate: bool = True) -> None:
+        name = " ".join(str(topic_name).strip().split())
+        if not 1 <= len(name) <= 128 or topic_id <= 0:
+            raise ValueError("Invalid reaction service topic")
+        now = dt_to_db(utc_now())
+        mode = "service" if activate else "subscriber"
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT INTO channel_reaction_settings(channel_id,mode,service_topic_id,service_topic_name,requires_repair,updated_at,updated_by)
+                   VALUES(?,?,?,?,0,?,?)
+                   ON CONFLICT(channel_id) DO UPDATE SET mode=excluded.mode,service_topic_id=excluded.service_topic_id,
+                     service_topic_name=excluded.service_topic_name,requires_repair=0,updated_at=excluded.updated_at,updated_by=excluded.updated_by""",
+                (channel_id, mode, topic_id, name, now, updated_by),
+            )
+            await self.conn.commit()
+
+    async def rename_reaction_service_topic(self, *, channel_id: int, topic_name: str, updated_by: int) -> bool:
+        name = " ".join(str(topic_name).strip().split())
+        if not 1 <= len(name) <= 128:
+            raise ValueError("Invalid reaction service topic name")
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_reaction_settings SET service_topic_name=?,updated_at=?,updated_by=? WHERE channel_id=? AND service_topic_id IS NOT NULL",
+                (name, dt_to_db(utc_now()), updated_by, channel_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def mark_reaction_service_topic_unavailable(self, *, channel_id: int) -> None:
+        async with self._write_lock:
+            await self.conn.execute(
+                "UPDATE channel_reaction_settings SET requires_repair=1,updated_at=? WHERE channel_id=?",
+                (dt_to_db(utc_now()), channel_id),
+            )
+            await self.conn.commit()
+
+    async def record_reaction_source(self, *, channel_id: int, group_id: int, forum_message_id: int, user_id: int, privacy_mode: str, private_chat_id: int, private_message_id: int, topic_id: int) -> None:
+        if privacy_mode not in {"identified", "anonymous"}:
+            raise ValueError("Invalid privacy mode")
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT OR REPLACE INTO channel_reaction_sources(
+                       channel_id,group_id,forum_message_id,user_id,privacy_mode,private_chat_id,private_message_id,topic_id,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (channel_id, group_id, forum_message_id, user_id, privacy_mode, private_chat_id, private_message_id, topic_id, dt_to_db(utc_now())),
+            )
+            await self.conn.commit()
+
+    async def get_reaction_source(self, *, group_id: int, forum_message_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_reaction_sources WHERE group_id=? AND forum_message_id=?",
+            (group_id, forum_message_id),
+        )).fetchone()
+
+    async def record_reaction_event(self, *, channel_id: int, group_id: int, source_message_id: int, actor_id: int, reaction_key: str, event_at: datetime, mode: str) -> bool:
+        if mode not in {"subscriber", "service"}:
+            raise ValueError("Invalid reaction mode")
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """INSERT OR IGNORE INTO channel_reaction_events(
+                       channel_id,group_id,source_message_id,actor_id,reaction_key,event_at,mode,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (channel_id, group_id, source_message_id, actor_id, reaction_key, dt_to_db(event_at), mode, dt_to_db(utc_now())),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def claim_reaction_dispatch(self, *, channel_id: int, group_id: int, source_message_id: int, service_topic_id: int, triggered_by: int, reaction_key: str) -> bool:
+        now = dt_to_db(utc_now())
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """INSERT OR IGNORE INTO channel_reaction_dispatches(
+                       channel_id,group_id,source_message_id,service_topic_id,status,triggered_by,reaction_key,created_at,updated_at
+                   ) VALUES(?,?,?,?,'sending',?,?,?,?)""",
+                (channel_id, group_id, source_message_id, service_topic_id, triggered_by, reaction_key, now, now),
+            )
+            if cursor.rowcount == 0:
+                cursor = await self.conn.execute(
+                    """UPDATE channel_reaction_dispatches SET status='sending',service_topic_id=?,triggered_by=?,reaction_key=?,
+                           error_code=NULL,updated_at=?
+                       WHERE channel_id=? AND group_id=? AND source_message_id=? AND status='error'""",
+                    (service_topic_id, triggered_by, reaction_key, now, channel_id, group_id, source_message_id),
+                )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def complete_reaction_dispatch(self, *, channel_id: int, group_id: int, source_message_id: int, destination_message_id: int) -> bool:
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """UPDATE channel_reaction_dispatches SET status='sent',destination_message_id=?,error_code=NULL,updated_at=?
+                   WHERE channel_id=? AND group_id=? AND source_message_id=? AND status='sending'""",
+                (destination_message_id, dt_to_db(utc_now()), channel_id, group_id, source_message_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def fail_reaction_dispatch(self, *, channel_id: int, group_id: int, source_message_id: int, error_code: str) -> bool:
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                """UPDATE channel_reaction_dispatches SET status='error',error_code=?,updated_at=?
+                   WHERE channel_id=? AND group_id=? AND source_message_id=? AND status='sending'""",
+                (error_code[:120], dt_to_db(utc_now()), channel_id, group_id, source_message_id),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    # ------------------------------------------------------------------
+    # Channels. owner_id identifies a human owner; channel_id identifies a
+    # concrete configured submission channel.
+    # ------------------------------------------------------------------
+    async def register_channel(self, *, owner_id: int, group_id: int, group_title: str, default_reset_days: int, default_notice_text: str, default_timezone: str, anonymous_prefix: str = "Анон") -> tuple[str, sqlite3.Row | None]:
+        now = utc_now()
+        normalized_prefix = self.normalize_anonymous_prefix(anonymous_prefix)
+        async with self._write_lock:
+            row = await (await self.conn.execute("SELECT * FROM channels WHERE group_id=?", (group_id,))).fetchone()
+            if row is not None:
+                if int(row["owner_id"]) != owner_id: return "group_has_other_owner", row
+                await self.conn.execute("UPDATE channels SET group_title=?, updated_at=?, enabled=1 WHERE channel_id=?", (group_title, dt_to_db(now), row["channel_id"]))
+                await self.conn.commit()
+                return "existing", await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=?", (row["channel_id"],))).fetchone()
+            count = (await (await self.conn.execute("SELECT COUNT(*) AS c FROM channels WHERE owner_id=?", (owner_id,))).fetchone())["c"]
+            if int(count) >= 5: return "owner_channel_limit", None
+            next_reset=now+timedelta(days=default_reset_days)
+            cursor=await self.conn.execute("""INSERT INTO channels(owner_id,group_id,group_title,created_at,updated_at,reset_interval_days,notice_text,timezone_name,next_reset_at,enabled,auto_cleanup_enabled,anonymous_prefix) VALUES(?,?,?,?,?,?,?,?,?,1,1,?)""",(owner_id,group_id,group_title,dt_to_db(now),dt_to_db(now),default_reset_days,default_notice_text,default_timezone,dt_to_db(next_reset),normalized_prefix))
+            channel_id=int(cursor.lastrowid)
+            await self.conn.execute("INSERT INTO channel_anonymous_counters(channel_id,next_number,cycle_key) VALUES(?,1,?)",(channel_id,dt_to_db(next_reset)))
+            await self.conn.commit()
+            return "created", await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=?",(channel_id,))).fetchone()
+
+    async def get_channel_by_id(self, channel_id:int) -> sqlite3.Row|None:
+        return await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=? AND enabled=1",(channel_id,))).fetchone()
+    async def get_channel_by_group(self, group_id:int) -> sqlite3.Row|None:
+        return await (await self.conn.execute("SELECT * FROM channels WHERE group_id=? AND enabled=1",(group_id,))).fetchone()
+    async def get_legacy_channel_for_owner(self, owner_id:int) -> sqlite3.Row|None:
+        return await (await self.conn.execute("SELECT c.* FROM legacy_owner_channels l JOIN channels c ON c.channel_id=l.channel_id WHERE l.owner_id=? AND c.enabled=1",(owner_id,))).fetchone()
+    async def list_enabled_channels(self)->list[sqlite3.Row]:
+        return await (await self.conn.execute("SELECT * FROM channels WHERE enabled=1 ORDER BY channel_id")).fetchall()
+    async def list_enabled_channels_for_owner(self, owner_id: int) -> list[sqlite3.Row]:
+        return await (await self.conn.execute("SELECT * FROM channels WHERE owner_id=? AND enabled=1 ORDER BY channel_id", (owner_id,))).fetchall()
+    async def set_active_admin_channel(self, *, owner_id: int, channel_id: int) -> bool:
+        channel = await (await self.conn.execute("SELECT 1 FROM channels WHERE channel_id=? AND owner_id=? AND enabled=1", (channel_id, owner_id))).fetchone()
+        if channel is None:
+            return False
+        async with self._write_lock:
+            await self.conn.execute("INSERT INTO active_admin_channel(owner_id,channel_id,selected_at) VALUES(?,?,?) ON CONFLICT(owner_id) DO UPDATE SET channel_id=excluded.channel_id,selected_at=excluded.selected_at", (owner_id, channel_id, dt_to_db(utc_now())))
+            await self.conn.commit()
+        return True
+    async def get_active_admin_channel(self, owner_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute("SELECT c.* FROM active_admin_channel a JOIN channels c ON c.channel_id=a.channel_id WHERE a.owner_id=? AND c.owner_id=? AND c.enabled=1", (owner_id, owner_id))).fetchone()
+    async def set_channel_period(self, channel_id:int, days:int)->datetime:
+        if days<2: raise ValueError("Период очистки должен быть не меньше 2 дней")
+        next_reset=utc_now()+timedelta(days=days)
+        async with self._write_lock:
+            await self.conn.execute("UPDATE channels SET reset_interval_days=?,next_reset_at=?,updated_at=? WHERE channel_id=?",(days,dt_to_db(next_reset),dt_to_db(utc_now()),channel_id)); await self.conn.commit()
+        return next_reset
+    async def set_channel_notice(self, channel_id:int,text:str)->None: await self._update_channel(channel_id,"notice_text",text)
+    async def set_channel_topic_template(self, *, channel_id: int, privacy_mode: str, template: str) -> None:
+        if privacy_mode not in {"identified", "anonymous"}:
+            raise ValueError("Invalid privacy mode")
+        column = "identified_topic_template" if privacy_mode == "identified" else "anonymous_topic_template"
+        async with self._write_lock:
+            await self.conn.execute(f"UPDATE channels SET {column}=?, updated_at=? WHERE channel_id=?", (template, dt_to_db(utc_now()), channel_id))
+            await self.conn.commit()
+    async def set_channel_timezone(self, channel_id:int,timezone_name:str)->None: await self._update_channel(channel_id,"timezone_name",timezone_name)
+    async def _update_channel(self,channel_id:int,column:str,value:str)->None:
+        async with self._write_lock:
+            await self.conn.execute(f"UPDATE channels SET {column}=?,updated_at=? WHERE channel_id=?",(value,dt_to_db(utc_now()),channel_id)); await self.conn.commit()
+    async def set_auto_cleanup_enabled(self,channel_id:int,enabled:bool)->None:
+        async with self._write_lock:
+            await self.conn.execute("UPDATE channels SET auto_cleanup_enabled=?,updated_at=? WHERE channel_id=?",(int(enabled),dt_to_db(utc_now()),channel_id)); await self.conn.commit()
+
+    async def enable_auto_cleanup(self, *, channel_id: int, days: int) -> datetime:
+        if days < 2:
+            raise ValueError("Cleanup period must be at least 2 days")
+        now = utc_now()
+        next_reset = now + timedelta(days=days)
+        async with self._write_lock:
+            await self.conn.execute(
+                "UPDATE channels SET auto_cleanup_enabled=1, reset_interval_days=?, next_reset_at=?, updated_at=? WHERE channel_id=?",
+                (days, dt_to_db(next_reset), dt_to_db(now), channel_id),
+            )
+            await self.conn.commit()
         return next_reset
 
-    async def set_tenant_notice(
-        self,
-        owner_id: int,
-        text: str,
-    ) -> None:
+    async def advance_channel_reset(self,*,channel_id:int,next_reset_at:datetime)->None:
+        """Advance a completed cleanup cycle and atomically restart anonymous numbering."""
+        next_reset_value = dt_to_db(next_reset_at)
+        cycle_key = f"auto:{uuid.uuid4().hex}"
         async with self._write_lock:
             await self.conn.execute(
-                """
-                UPDATE tenants
-                SET notice_text = ?, updated_at = ?
-                WHERE owner_id = ?
-                """,
-                (text, dt_to_db(utc_now()), owner_id),
+                "UPDATE channels SET next_reset_at=?,updated_at=? WHERE channel_id=?",
+                (next_reset_value,dt_to_db(utc_now()),channel_id),
             )
+            cursor = await self.conn.execute(
+                "UPDATE channel_anonymous_counters SET next_number=1,cycle_key=? WHERE channel_id=?",
+                (cycle_key,channel_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Unknown channel_id")
             await self.conn.commit()
 
-    async def set_tenant_timezone(
-        self,
-        owner_id: int,
-        timezone_name: str,
-    ) -> None:
+    @staticmethod
+    def normalize_anonymous_prefix(value: str) -> str:
+        prefix = " ".join(str(value).strip().split())
+        if not 1 <= len(prefix) <= 32:
+            raise ValueError("Anonymous prefix must contain 1 to 32 characters")
+        return prefix
+
+    async def set_channel_anonymous_prefix(self, *, channel_id: int, prefix: str) -> str:
+        normalized = self.normalize_anonymous_prefix(prefix)
         async with self._write_lock:
-            await self.conn.execute(
-                """
-                UPDATE tenants
-                SET timezone_name = ?, updated_at = ?
-                WHERE owner_id = ?
-                """,
-                (timezone_name, dt_to_db(utc_now()), owner_id),
+            cursor = await self.conn.execute(
+                "UPDATE channels SET anonymous_prefix=?,updated_at=? WHERE channel_id=?",
+                (normalized,dt_to_db(utc_now()),channel_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Unknown channel_id")
             await self.conn.commit()
+        return normalized
 
-    async def advance_tenant_reset(
-        self,
-        *,
-        owner_id: int,
-        next_reset_at: datetime,
-    ) -> None:
+    async def get_anonymous_counter_state(self, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            """SELECT c.anonymous_prefix, x.next_number, x.cycle_key
+               FROM channels c JOIN channel_anonymous_counters x ON x.channel_id=c.channel_id
+               WHERE c.channel_id=? AND c.enabled=1""",
+            (channel_id,),
+        )).fetchone()
+
+    async def reset_anonymous_cycle(self, channel_id: int) -> str:
+        cycle_key = f"manual:{uuid.uuid4().hex}"
         async with self._write_lock:
-            await self.conn.execute(
-                """
-                UPDATE tenants
-                SET next_reset_at = ?, updated_at = ?
-                WHERE owner_id = ?
-                """,
-                (
-                    dt_to_db(next_reset_at),
-                    dt_to_db(utc_now()),
-                    owner_id,
-                ),
+            cursor = await self.conn.execute(
+                "UPDATE channel_anonymous_counters SET next_number=1,cycle_key=? WHERE channel_id=?",
+                (cycle_key,channel_id),
             )
+            if cursor.rowcount != 1:
+                raise ValueError("Unknown channel_id")
             await self.conn.commit()
+        return cycle_key
 
-    # ------------------------------------------------------------------
-    # Users and tenant memberships
-    # ------------------------------------------------------------------
+    async def get_privacy_mode(self,*,channel_id:int,user_id:int)->str|None:
+        row=await (await self.conn.execute("SELECT privacy_mode FROM channel_subscriber_privacy WHERE channel_id=? AND user_id=?",(channel_id,user_id))).fetchone()
+        return str(row["privacy_mode"]) if row else None
 
-    async def upsert_user(
-        self,
-        *,
-        user_id: int,
-        first_name: str,
-        last_name: str | None,
-        username: str | None,
-    ) -> None:
-        now = dt_to_db(utc_now())
+    async def _ensure_anonymous_tag_locked(self, *, channel_id: int, user_id: int) -> str:
+        state = await (await self.conn.execute(
+            """SELECT c.anonymous_prefix,x.cycle_key
+               FROM channels c JOIN channel_anonymous_counters x ON x.channel_id=c.channel_id
+               WHERE c.channel_id=? AND c.enabled=1""",
+            (channel_id,),
+        )).fetchone()
+        if state is None:
+            raise ValueError("Unknown channel_id")
+        cycle_key = str(state["cycle_key"])
+        existing = await (await self.conn.execute(
+            "SELECT tag FROM anonymous_tags WHERE channel_id=? AND user_id=? AND cycle_key=?",
+            (channel_id,user_id,cycle_key),
+        )).fetchone()
+        if existing is not None:
+            return str(existing["tag"])
+        row = await (await self.conn.execute(
+            "UPDATE channel_anonymous_counters SET next_number=next_number+1 WHERE channel_id=? RETURNING next_number-1 AS number",
+            (channel_id,),
+        )).fetchone()
+        if row is None:
+            raise ValueError("Unknown channel_id")
+        number = int(row["number"])
+        tag = f"{state['anonymous_prefix']}-{number}"
+        await self.conn.execute(
+            "INSERT INTO anonymous_tags(channel_id,user_id,cycle_key,number,tag,assigned_at) VALUES(?,?,?,?,?,?)",
+            (channel_id,user_id,cycle_key,number,tag,dt_to_db(utc_now())),
+        )
+        return tag
 
+    async def ensure_anonymous_tag(self, *, channel_id: int, user_id: int) -> str:
         async with self._write_lock:
-            await self.conn.execute(
-                """
-                INSERT INTO users (
-                    user_id,
-                    first_name,
-                    last_name,
-                    username,
-                    first_seen_at,
-                    last_seen_at,
-                    blocked
+            tag = await self._ensure_anonymous_tag_locked(channel_id=channel_id,user_id=user_id)
+            await self.conn.commit()
+        return tag
+
+    async def set_privacy_mode(self,*,channel_id:int,user_id:int,privacy_mode:str)->str|None:
+        if privacy_mode not in {"identified","anonymous"}: raise ValueError("Invalid privacy mode")
+        async with self._write_lock:
+            await self.conn.execute("INSERT INTO channel_subscriber_privacy(channel_id,user_id,privacy_mode,updated_at) VALUES(?,?,?,?) ON CONFLICT(channel_id,user_id) DO UPDATE SET privacy_mode=excluded.privacy_mode,updated_at=excluded.updated_at",(channel_id,user_id,privacy_mode,dt_to_db(utc_now())))
+            tag = await self._ensure_anonymous_tag_locked(channel_id=channel_id,user_id=user_id) if privacy_mode == "anonymous" else None
+            await self.conn.commit()
+            return tag
+
+    async def get_anonymous_tag(self,*,channel_id:int,user_id:int)->str|None:
+        row=await (await self.conn.execute(
+            """SELECT t.tag FROM anonymous_tags t
+               JOIN channel_anonymous_counters x ON x.channel_id=t.channel_id AND x.cycle_key=t.cycle_key
+               WHERE t.channel_id=? AND t.user_id=?""",
+            (channel_id,user_id),
+        )).fetchone()
+        return str(row["tag"]) if row else None
+
+    async def upsert_user(self,*,user_id:int,first_name:str,last_name:str|None,username:str|None)->None:
+        now=dt_to_db(utc_now())
+        async with self._write_lock:
+            await self.conn.execute("INSERT INTO users(user_id,first_name,last_name,username,first_seen_at,last_seen_at,blocked) VALUES(?,?,?,?,?,?,0) ON CONFLICT(user_id) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name,username=excluded.username,last_seen_at=excluded.last_seen_at",(user_id,first_name,last_name,username,now,now)); await self.conn.commit()
+    async def set_user_blocked(self,user_id:int,blocked:bool)->None:
+        async with self._write_lock: await self.conn.execute("UPDATE users SET blocked=? WHERE user_id=?",(int(blocked),user_id)); await self.conn.commit()
+    async def attach_subscriber(self,*,channel_id:int,user_id:int)->None:
+        now=dt_to_db(utc_now())
+        async with self._write_lock:
+            await self.conn.execute("INSERT INTO channel_subscribers(channel_id,user_id,first_seen_at,last_seen_at) VALUES(?,?,?,?) ON CONFLICT(channel_id,user_id) DO UPDATE SET last_seen_at=excluded.last_seen_at",(channel_id,user_id,now,now))
+            await self.conn.execute("INSERT INTO active_channel(user_id,channel_id,selected_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET channel_id=excluded.channel_id,selected_at=excluded.selected_at",(user_id,channel_id,now)); await self.conn.commit()
+    async def touch_subscriber(self,*,channel_id:int,user_id:int)->None:
+        async with self._write_lock: await self.conn.execute("UPDATE channel_subscribers SET last_seen_at=? WHERE channel_id=? AND user_id=?",(dt_to_db(utc_now()),channel_id,user_id)); await self.conn.commit()
+    async def get_active_channel_for_user(self,user_id:int)->sqlite3.Row|None:
+        return await (await self.conn.execute("SELECT c.* FROM active_channel a JOIN channels c ON c.channel_id=a.channel_id WHERE a.user_id=? AND c.enabled=1",(user_id,))).fetchone()
+    async def list_enabled_channels_for_user(self,user_id:int)->list[sqlite3.Row]:
+        return await (await self.conn.execute("SELECT c.* FROM channel_subscribers s JOIN channels c ON c.channel_id=s.channel_id WHERE s.user_id=? AND c.enabled=1 ORDER BY c.group_title COLLATE NOCASE, c.channel_id",(user_id,))).fetchall()
+    async def set_active_channel(self,*,user_id:int,channel_id:int)->bool:
+        async with self._write_lock:
+            row=await (await self.conn.execute("SELECT 1 FROM channel_subscribers s JOIN channels c ON c.channel_id=s.channel_id WHERE s.user_id=? AND s.channel_id=? AND c.enabled=1",(user_id,channel_id))).fetchone()
+            if row is None: return False
+            await self.conn.execute("INSERT INTO active_channel(user_id,channel_id,selected_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET channel_id=excluded.channel_id,selected_at=excluded.selected_at",(user_id,channel_id,dt_to_db(utc_now())))
+            await self.conn.commit(); return True
+    async def count_channel_subscribers(self,channel_id:int)->int:
+        return int((await (await self.conn.execute("SELECT COUNT(*) AS c FROM channel_subscribers WHERE channel_id=?",(channel_id,))).fetchone())["c"])
+    async def get_unnotified_subscribers(self,*,channel_id:int,cycle_at:str)->list[int]:
+        rows=await (await self.conn.execute("SELECT s.user_id FROM channel_subscribers s LEFT JOIN channel_notification_log n ON n.channel_id=s.channel_id AND n.user_id=s.user_id AND n.cycle_at=? WHERE s.channel_id=? AND n.user_id IS NULL ORDER BY s.user_id",(cycle_at,channel_id))).fetchall(); return [int(r["user_id"]) for r in rows]
+    async def mark_notification_sent(self,*,channel_id:int,cycle_at:str,user_id:int)->None:
+        async with self._write_lock: await self.conn.execute("INSERT OR IGNORE INTO channel_notification_log(channel_id,cycle_at,user_id,sent_at) VALUES(?,?,?,?)",(channel_id,cycle_at,user_id,dt_to_db(utc_now()))); await self.conn.commit()
+    async def get_topic_for_user(self,*,channel_id:int,user_id:int,privacy_mode:str="identified")->sqlite3.Row|None: return await (await self.conn.execute("SELECT * FROM channel_topics WHERE channel_id=? AND user_id=? AND privacy_mode=?",(channel_id,user_id,privacy_mode))).fetchone()
+    async def get_subscriber_card_data(self, *, channel_id: int, user_id: int, privacy_mode: str) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            """SELECT s.first_seen_at, s.last_seen_at,
+                      (SELECT COUNT(*) FROM message_events e WHERE e.channel_id=s.channel_id AND e.user_id=s.user_id AND e.privacy_mode=? AND e.direction='subscriber_to_admin') AS message_count,
+                      t.tag AS anonymous_tag
+               FROM channel_subscribers s
+               LEFT JOIN anonymous_tags t ON t.channel_id=s.channel_id AND t.user_id=s.user_id
+                    AND t.cycle_key=(SELECT cycle_key FROM channel_anonymous_counters WHERE channel_id=s.channel_id)
+               WHERE s.channel_id=? AND s.user_id=?""",
+            (privacy_mode, channel_id, user_id),
+        )).fetchone()
+    async def get_topic_by_group_thread(self,*,group_id:int,topic_id:int)->sqlite3.Row|None: return await (await self.conn.execute("SELECT * FROM channel_topics WHERE group_id=? AND topic_id=?",(group_id,topic_id))).fetchone()
+    @staticmethod
+    def _like_literal(query: str) -> str:
+        return query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    async def search_subscribers(self, *, channel_id: int, query: str, privacy_filter: str = "all", offset: int = 0, limit: int = 8, conversations_only: bool = False) -> tuple[list[dict[str, object]], int]:
+        normalized = " ".join(query.strip().split())
+        if not normalized or len(normalized) > 96 or privacy_filter not in {"all", "identified", "anonymous"}:
+            raise ValueError("Invalid search query")
+        pattern = f"%{self._like_literal(normalized.lstrip('@'))}%"
+        mode_clause = "" if privacy_filter == "all" else " AND COALESCE(p.privacy_mode,'identified')=?"
+        mode_params: list[object] = [] if privacy_filter == "all" else [privacy_filter]
+        base = f"""SELECT s.user_id,p.privacy_mode,u.first_name,u.last_name,u.username,t.tag,ct.status,ct.topic_id,ct.group_id
+FROM channel_subscribers s JOIN users u ON u.user_id=s.user_id
+LEFT JOIN channel_subscriber_privacy p ON p.channel_id=s.channel_id AND p.user_id=s.user_id
+LEFT JOIN anonymous_tags t ON t.channel_id=s.channel_id AND t.user_id=s.user_id AND t.cycle_key=(SELECT cycle_key FROM channel_anonymous_counters WHERE channel_id=s.channel_id)
+LEFT JOIN channel_topics ct ON ct.channel_id=s.channel_id AND ct.user_id=s.user_id AND ct.privacy_mode=COALESCE(p.privacy_mode,'identified')
+WHERE s.channel_id=? {mode_clause} {' AND ct.topic_id IS NOT NULL' if conversations_only else ''} AND ((COALESCE(p.privacy_mode,'identified')='anonymous' AND EXISTS (SELECT 1 FROM anonymous_tags previous_tag WHERE previous_tag.channel_id=s.channel_id AND previous_tag.user_id=s.user_id AND previous_tag.tag LIKE ? ESCAPE '\\')) OR (COALESCE(p.privacy_mode,'identified')='identified' AND (u.first_name LIKE ? ESCAPE '\\' OR u.last_name LIKE ? ESCAPE '\\' OR u.username LIKE ? ESCAPE '\\' OR CAST(u.user_id AS TEXT)=?)))"""
+        args=[channel_id,*mode_params,pattern,pattern,pattern,pattern,normalized]
+        rows=await (await self.conn.execute(base+" ORDER BY CASE WHEN COALESCE(p.privacy_mode,'identified')='anonymous' THEN t.tag ELSE u.first_name END COLLATE NOCASE, s.user_id LIMIT ? OFFSET ?",[*args,limit,offset])).fetchall()
+        total=int((await (await self.conn.execute("SELECT COUNT(*) c FROM ("+base+")",args)).fetchone())['c'])
+        out=[]
+        for r in rows:
+            anonymous=str(r['privacy_mode'] or 'identified')=='anonymous'
+            out.append({'user_id':int(r['user_id']),'privacy_mode':'anonymous' if anonymous else 'identified','display_name':str(r['tag'] or 'Анонимная подписчица') if anonymous else ' '.join(x for x in (str(r['first_name'] or ''),str(r['last_name'] or '')) if x).strip() or 'Подписчица','status':str(r['status']) if r['status'] else None,'topic_id':int(r['topic_id']) if r['topic_id'] else None,'group_id':int(r['group_id']) if r['group_id'] else None})
+        return out,total
+
+    async def get_subscriber_moderation(self, *, channel_id: int, user_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute("SELECT * FROM channel_subscriber_moderation WHERE channel_id=? AND user_id=?", (channel_id, user_id))).fetchone()
+    @staticmethod
+    def resolve_sanction_reason(choice: str | None, custom_reason: str | None = None) -> str:
+        if choice not in SANCTION_REASON_CHOICES:
+            raise ValueError("A sanction reason is required")
+        if choice == "other":
+            text = (custom_reason or "").strip()
+            if not text:
+                raise ValueError("A custom sanction reason is required")
+            return text[:1000]
+        return SANCTION_REASON_LABELS[str(choice)]
+
+    async def apply_subscriber_sanction(self, *, channel_id: int, user_id: int, admin_id: int, action: str, reason_choice: str | None, custom_reason: str | None = None, show_reason_to_subscriber: bool = False, rate_limit_seconds: int | None = None, muted_until: datetime | None = None, blocked_until: datetime | None = None, permanently_blocked: bool | None = None, duration_seconds: int | None = None) -> str:
+        if action not in SANCTION_ACTIONS:
+            raise ValueError("Unknown sanction action")
+        if type(show_reason_to_subscriber) is not bool:
+            raise ValueError("Invalid reason visibility")
+        reason = self.resolve_sanction_reason(reason_choice, custom_reason)
+        now = utc_now()
+        expires_at: datetime | None = None
+        rate_seconds: int | None = None
+        if action == "rate_limit":
+            rate_seconds = rate_limit_seconds if rate_limit_seconds is not None else duration_seconds
+            if not isinstance(rate_seconds, int) or rate_seconds < 1:
+                raise ValueError("A positive rate limit is required")
+            # A rate limit is an ongoing per-channel policy, not a one-shot
+            # temporary block.  It stays active until an administrator revokes
+            # it; each accepted subscriber publication starts the next interval.
+            expires_at = None
+            await self.update_subscriber_moderation(channel_id=channel_id, user_id=user_id, rate_limit_seconds=rate_seconds, sanction_reason=reason, show_reason_to_subscriber=show_reason_to_subscriber)
+        elif action == "mute":
+            expires_at = muted_until or (now + timedelta(seconds=duration_seconds or 60))
+            if expires_at <= now:
+                raise ValueError("A future mute expiry is required")
+            await self.update_subscriber_moderation(channel_id=channel_id, user_id=user_id, muted_until=expires_at, sanction_reason=reason, show_reason_to_subscriber=show_reason_to_subscriber)
+        elif action == "temporary_block":
+            expires_at = blocked_until or (now + timedelta(seconds=duration_seconds or 60))
+            if expires_at <= now:
+                raise ValueError("A future block expiry is required")
+            await self.update_subscriber_moderation(channel_id=channel_id, user_id=user_id, blocked_until=expires_at, sanction_reason=reason, show_reason_to_subscriber=show_reason_to_subscriber)
+        elif action == "permanent_block":
+            await self.update_subscriber_moderation(channel_id=channel_id, user_id=user_id, permanently_blocked=True, sanction_reason=reason, show_reason_to_subscriber=show_reason_to_subscriber)
+        # A warning intentionally has no active restriction state. Reapplying
+        # the same restriction replaces only the currently effective instance,
+        # so an older sanction cannot unexpectedly reappear after a newer one.
+        async with self._write_lock:
+            if action != "warning":
+                await self.conn.execute(
+                    "UPDATE subscriber_sanctions SET active=0,revoked_at=?,revoked_by=? "
+                    "WHERE channel_id=? AND user_id=? AND action=? AND active=1 "
+                    "AND (expires_at IS NULL OR expires_at>?)",
+                    (dt_to_db(now), admin_id, channel_id, user_id, action, dt_to_db(now)),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, 0)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    first_name = excluded.first_name,
-                    last_name = excluded.last_name,
-                    username = excluded.username,
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (
-                    user_id,
-                    first_name,
-                    last_name,
-                    username,
-                    now,
-                    now,
-                ),
+            await self.conn.execute("INSERT INTO subscriber_sanctions(channel_id,user_id,action,rate_limit_seconds,expires_at,reason,show_reason_to_subscriber,active,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (channel_id,user_id,action,rate_seconds,dt_to_db(expires_at) if expires_at else None,reason,int(show_reason_to_subscriber),0 if action == "warning" else 1,dt_to_db(now)))
+            await self.conn.commit()
+        await self.record_moderation_action(channel_id=channel_id, user_id=user_id, admin_id=admin_id, action=action, reason=reason, expires_at=expires_at, details=None, show_reason_to_subscriber=show_reason_to_subscriber, created_at=now)
+        return reason
+
+    async def list_active_sanctions(self, *, channel_id: int, user_id: int, now: datetime | None = None) -> list[sqlite3.Row]:
+        moment = dt_to_db(now or utc_now())
+        return await (await self.conn.execute("SELECT * FROM subscriber_sanctions WHERE channel_id=? AND user_id=? AND active=1 AND action != 'warning' AND (expires_at IS NULL OR expires_at>?) ORDER BY CASE action WHEN 'permanent_block' THEN 1 WHEN 'temporary_block' THEN 2 WHEN 'mute' THEN 3 WHEN 'rate_limit' THEN 4 ELSE 9 END, sanction_id DESC", (channel_id,user_id,moment))).fetchall()
+
+    async def get_effective_subscriber_sanction(self, *, channel_id: int, user_id: int, now: datetime | None = None) -> sqlite3.Row | None:
+        rows = await self.list_active_sanctions(channel_id=channel_id, user_id=user_id, now=now)
+        return rows[0] if rows else None
+
+    async def revoke_active_sanctions(self, *, channel_id: int, user_id: int, admin_id: int) -> int:
+        now = utc_now()
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE subscriber_sanctions SET active=0,revoked_at=?,revoked_by=? "
+                "WHERE channel_id=? AND user_id=? AND active=1 AND action != 'warning' "
+                "AND (expires_at IS NULL OR expires_at>?)",
+                (dt_to_db(now),admin_id,channel_id,user_id,dt_to_db(now)),
+            )
+            count = cursor.rowcount
+            await self.conn.commit()
+        if count:
+            await self.update_subscriber_moderation(channel_id=channel_id,user_id=user_id,rate_limit_seconds=0,muted_until=now,blocked_until=now,permanently_blocked=False)
+            await self.record_moderation_action(channel_id=channel_id,user_id=user_id,admin_id=admin_id,action="clear_restrictions",details=str(count),created_at=now)
+        return count
+
+    async def record_moderation_action(self, *, channel_id: int, user_id: int, admin_id: int, action: str, reason: str | None = None, expires_at: datetime | None = None, details: str | None = None, show_reason_to_subscriber: bool = False, created_at: datetime | None = None) -> None:
+        async with self._write_lock:
+            await self.conn.execute("INSERT INTO moderation_log(channel_id,user_id,admin_id,action,reason,expires_at,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (channel_id,user_id,admin_id,action,reason,dt_to_db(expires_at) if expires_at else None,details,int(show_reason_to_subscriber),dt_to_db(created_at or utc_now())))
+            await self.conn.commit()
+    async def list_moderation_actions(self, *, channel_id: int, user_id: int) -> list[sqlite3.Row]:
+        return await (await self.conn.execute("SELECT * FROM moderation_log WHERE channel_id=? AND user_id=? ORDER BY log_id DESC", (channel_id,user_id))).fetchall()
+    async def get_subscriber_moderation_history(self, *, channel_id: int, user_id: int, offset: int = 0, limit: int = 10, now: datetime | None = None) -> list[dict[str, object]]:
+        if offset < 0 or not 1 <= limit <= 50: raise ValueError("Invalid history page")
+        moment=now or utc_now(); rows=await (await self.conn.execute("SELECT sanction_id AS item_id,action,reason,show_reason_to_subscriber,expires_at,active,created_at,revoked_at,revoked_by,rate_limit_seconds,(SELECT admin_id FROM moderation_log m WHERE m.channel_id=subscriber_sanctions.channel_id AND m.user_id=subscriber_sanctions.user_id AND m.action=subscriber_sanctions.action AND m.created_at=subscriber_sanctions.created_at ORDER BY log_id DESC LIMIT 1) AS admin_id FROM subscriber_sanctions WHERE channel_id=? AND user_id=? UNION ALL SELECT -log_id AS item_id,action,reason,show_reason_to_subscriber,expires_at,0 AS active,created_at,NULL,NULL,NULL,admin_id FROM moderation_log WHERE channel_id=? AND user_id=? AND action NOT IN ('rate_limit','mute','temporary_block','permanent_block','warning') ORDER BY created_at DESC,item_id DESC LIMIT ? OFFSET ?",(channel_id,user_id,channel_id,user_id,limit,offset))).fetchall()
+        result=[]
+        for row in rows:
+            expires=dt_from_db(str(row['expires_at'])) if row['expires_at'] else None
+            status='warning' if row['action']=='warning' else ('removed' if row['revoked_at'] else ('expired' if expires and expires<=moment else ('active' if row['active'] else 'historical')))
+            result.append({**dict(row),'status':status})
+        return result
+
+    async def count_subscriber_moderation_history(self, *, channel_id:int, user_id:int) -> int:
+        row=await (await self.conn.execute("SELECT (SELECT COUNT(*) FROM subscriber_sanctions WHERE channel_id=? AND user_id=?) + (SELECT COUNT(*) FROM moderation_log WHERE channel_id=? AND user_id=? AND action NOT IN ('rate_limit','mute','temporary_block','permanent_block','warning')) AS count",(channel_id,user_id,channel_id,user_id))).fetchone(); return int(row['count'])
+
+    async def _require_channel_subscriber(self, *, channel_id: int, user_id: int) -> None:
+        row = await (await self.conn.execute(
+            "SELECT 1 FROM channel_subscribers WHERE channel_id=? AND user_id=?",
+            (channel_id, user_id),
+        )).fetchone()
+        if row is None:
+            raise ValueError("Subscriber is not attached to this channel")
+
+    @staticmethod
+    def _normalize_subscriber_metadata_text(value: str, *, limit: int) -> str:
+        normalized = " ".join(value.split())
+        if not normalized:
+            raise ValueError("Metadata text must not be blank")
+        if len(normalized) > limit:
+            raise ValueError("Metadata text is too long")
+        return normalized
+
+    async def add_subscriber_note(self, *, channel_id: int, user_id: int, admin_id: int, note_text: str) -> int:
+        note = self._normalize_subscriber_metadata_text(note_text, limit=1000)
+        await self._require_channel_subscriber(channel_id=channel_id, user_id=user_id)
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "INSERT INTO subscriber_notes(channel_id,user_id,admin_id,note_text,created_at) VALUES(?,?,?,?,?)",
+                (channel_id, user_id, admin_id, note, dt_to_db(utc_now())),
+            )
+            note_id = int(cursor.lastrowid)
+            await self.conn.execute(
+                "INSERT INTO moderation_log(channel_id,user_id,admin_id,action,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)",
+                (channel_id, user_id, admin_id, "note_added", f"note_id={note_id}", 0, dt_to_db(utc_now())),
             )
             await self.conn.commit()
+        return note_id
 
-    async def set_user_blocked(
-        self,
-        user_id: int,
-        blocked: bool,
-    ) -> None:
+    async def list_subscriber_notes(self, *, channel_id: int, user_id: int, offset: int = 0, limit: int = 10) -> list[sqlite3.Row]:
+        if offset < 0 or not 1 <= limit <= 50:
+            raise ValueError("Invalid notes page")
+        return await (await self.conn.execute(
+            "SELECT * FROM subscriber_notes WHERE channel_id=? AND user_id=? AND deleted_at IS NULL ORDER BY note_id DESC LIMIT ? OFFSET ?",
+            (channel_id, user_id, limit, offset),
+        )).fetchall()
+
+    async def count_subscriber_notes(self, *, channel_id: int, user_id: int) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) AS count FROM subscriber_notes WHERE channel_id=? AND user_id=? AND deleted_at IS NULL",
+            (channel_id, user_id),
+        )).fetchone()
+        return int(row["count"])
+
+    async def get_subscriber_note(self, *, channel_id: int, user_id: int, note_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM subscriber_notes WHERE channel_id=? AND user_id=? AND note_id=? AND deleted_at IS NULL",
+            (channel_id, user_id, note_id),
+        )).fetchone()
+
+    async def update_subscriber_note(self, *, channel_id: int, user_id: int, note_id: int, admin_id: int, note_text: str) -> bool:
+        note = self._normalize_subscriber_metadata_text(note_text, limit=1000)
         async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE subscriber_notes SET note_text=?,updated_at=?,updated_by=? WHERE channel_id=? AND user_id=? AND note_id=? AND deleted_at IS NULL",
+                (note, dt_to_db(utc_now()), admin_id, channel_id, user_id, note_id),
+            )
+            if cursor.rowcount != 1:
+                await self.conn.rollback()
+                return False
             await self.conn.execute(
-                "UPDATE users SET blocked = ? WHERE user_id = ?",
-                (1 if blocked else 0, user_id),
+                "INSERT INTO moderation_log(channel_id,user_id,admin_id,action,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)",
+                (channel_id, user_id, admin_id, "note_updated", f"note_id={note_id}", 0, dt_to_db(utc_now())),
             )
             await self.conn.commit()
+        return True
 
-    async def attach_subscriber(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-    ) -> None:
-        now = dt_to_db(utc_now())
-
+    async def soft_delete_subscriber_note(self, *, channel_id: int, user_id: int, note_id: int, admin_id: int) -> bool:
         async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE subscriber_notes SET deleted_at=?,deleted_by=? WHERE channel_id=? AND user_id=? AND note_id=? AND deleted_at IS NULL",
+                (dt_to_db(utc_now()), admin_id, channel_id, user_id, note_id),
+            )
+            if cursor.rowcount != 1:
+                await self.conn.rollback()
+                return False
             await self.conn.execute(
-                """
-                INSERT INTO tenant_subscribers (
-                    owner_id,
-                    user_id,
-                    first_seen_at,
-                    last_seen_at
+                "INSERT INTO moderation_log(channel_id,user_id,admin_id,action,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)",
+                (channel_id, user_id, admin_id, "note_deleted", f"note_id={note_id}", 0, dt_to_db(utc_now())),
+            )
+            await self.conn.commit()
+        return True
+
+    async def add_subscriber_tag(self, *, channel_id: int, user_id: int, admin_id: int, tag: str) -> bool:
+        normalized = self._normalize_subscriber_metadata_text(tag, limit=64)
+        tag_key = normalized.casefold()
+        await self._require_channel_subscriber(channel_id=channel_id, user_id=user_id)
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "INSERT OR IGNORE INTO subscriber_tags(channel_id,user_id,tag,tag_key,added_by,created_at) VALUES(?,?,?,?,?,?)",
+                (channel_id, user_id, normalized, tag_key, admin_id, dt_to_db(utc_now())),
+            )
+            created = cursor.rowcount == 1
+            if created:
+                await self.conn.execute(
+                    "INSERT INTO moderation_log(channel_id,user_id,admin_id,action,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (channel_id, user_id, admin_id, "tag_added", normalized, 0, dt_to_db(utc_now())),
                 )
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(owner_id, user_id) DO UPDATE SET
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (owner_id, user_id, now, now),
-            )
+            await self.conn.commit()
+        return created
 
+    async def list_subscriber_tags(self, *, channel_id: int, user_id: int, offset: int = 0, limit: int = 20) -> list[sqlite3.Row]:
+        if offset < 0 or not 1 <= limit <= 50:
+            raise ValueError("Invalid tags page")
+        return await (await self.conn.execute(
+            "SELECT * FROM subscriber_tags WHERE channel_id=? AND user_id=? ORDER BY tag COLLATE NOCASE,tag_id LIMIT ? OFFSET ?",
+            (channel_id, user_id, limit, offset),
+        )).fetchall()
+
+    async def count_subscriber_tags(self, *, channel_id: int, user_id: int) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) AS count FROM subscriber_tags WHERE channel_id=? AND user_id=?",
+            (channel_id, user_id),
+        )).fetchone()
+        return int(row["count"])
+
+    async def get_subscriber_tag(self, *, channel_id: int, user_id: int, tag_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM subscriber_tags WHERE channel_id=? AND user_id=? AND tag_id=?",
+            (channel_id, user_id, tag_id),
+        )).fetchone()
+
+    async def delete_subscriber_tag(self, *, channel_id: int, user_id: int, tag_id: int, admin_id: int) -> bool:
+        async with self._write_lock:
+            row = await (await self.conn.execute(
+                "SELECT tag FROM subscriber_tags WHERE channel_id=? AND user_id=? AND tag_id=?",
+                (channel_id, user_id, tag_id),
+            )).fetchone()
+            if row is None:
+                return False
+            cursor = await self.conn.execute(
+                "DELETE FROM subscriber_tags WHERE channel_id=? AND user_id=? AND tag_id=?",
+                (channel_id, user_id, tag_id),
+            )
+            if cursor.rowcount != 1:
+                await self.conn.rollback()
+                return False
             await self.conn.execute(
-                """
-                INSERT INTO active_tenant (
-                    user_id,
-                    owner_id,
-                    selected_at
+                "INSERT INTO moderation_log(channel_id,user_id,admin_id,action,details,show_reason_to_subscriber,created_at) VALUES(?,?,?,?,?,?,?)",
+                (channel_id, user_id, admin_id, "tag_deleted", str(row["tag"]), 0, dt_to_db(utc_now())),
+            )
+            await self.conn.commit()
+        return True
+
+    async def get_last_subscriber_message_at(self, *, channel_id: int, user_id: int) -> datetime | None:
+        row = await (await self.conn.execute(
+            "SELECT occurred_at FROM message_events WHERE channel_id=? AND user_id=? "
+            "AND direction='subscriber_to_admin' ORDER BY occurred_at DESC,event_id DESC LIMIT 1",
+            (channel_id, user_id),
+        )).fetchone()
+        return dt_from_db(str(row["occurred_at"])) if row is not None else None
+
+    async def _rate_limit_next_allowed_at(self, *, sanction: sqlite3.Row, channel_id: int, user_id: int) -> datetime | None:
+        seconds = sanction["rate_limit_seconds"]
+        if not isinstance(seconds, int) or seconds < 1:
+            return None
+        last_message = await self.get_last_subscriber_message_at(channel_id=channel_id, user_id=user_id)
+        return last_message + timedelta(seconds=seconds) if last_message is not None else None
+
+    async def active_subscriber_restriction(self, *, channel_id: int, user_id: int, now: datetime | None = None) -> tuple[str, datetime | None] | None:
+        moment = now or utc_now()
+        sanction = await self.get_effective_subscriber_sanction(channel_id=channel_id,user_id=user_id,now=moment)
+        if sanction is not None:
+            action = str(sanction["action"])
+            if action == "rate_limit":
+                next_allowed = await self._rate_limit_next_allowed_at(
+                    sanction=sanction, channel_id=channel_id, user_id=user_id
                 )
-                VALUES (?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    owner_id = excluded.owner_id,
-                    selected_at = excluded.selected_at
-                """,
-                (user_id, owner_id, now),
-            )
+                return ("rate_limited", next_allowed) if next_allowed is not None and next_allowed > moment else None
+            mapping={"permanent_block":"permanently_blocked","temporary_block":"blocked","mute":"muted"}
+            raw=sanction["expires_at"]
+            return mapping[action], dt_from_db(str(raw)) if raw else None
+        # Compatibility fallback for callers that still set the pre-v13 state directly.
+        state = await self.get_subscriber_moderation(channel_id=channel_id, user_id=user_id)
+        if state is None:
+            return None
+        if bool(state["permanently_blocked"]): return "permanently_blocked", None
+        for kind, field in (("blocked", "blocked_until"), ("muted", "muted_until")):
+            if state[field] and dt_from_db(str(state[field])) > moment: return kind, dt_from_db(str(state[field]))
+        if state["rate_limit_seconds"]:
+            until=dt_from_db(str(state["updated_at"]))+timedelta(seconds=int(state["rate_limit_seconds"]))
+            if until>moment: return "rate_limited",until
+        return None
 
-            await self.conn.commit()
-
-    async def touch_subscriber(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-    ) -> None:
-        async with self._write_lock:
-            await self.conn.execute(
-                """
-                UPDATE tenant_subscribers
-                SET last_seen_at = ?
-                WHERE owner_id = ? AND user_id = ?
-                """,
-                (dt_to_db(utc_now()), owner_id, user_id),
-            )
-            await self.conn.commit()
-
-    async def get_active_tenant_for_user(
-        self,
-        user_id: int,
-    ) -> sqlite3.Row | None:
-        cursor = await self.conn.execute(
-            """
-            SELECT t.*
-            FROM active_tenant a
-            JOIN tenants t ON t.owner_id = a.owner_id
-            WHERE a.user_id = ?
-              AND t.enabled = 1
-            """,
-            (user_id,),
-        )
-        return await cursor.fetchone()
-
-    async def count_tenant_subscribers(self, owner_id: int) -> int:
-        cursor = await self.conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM tenant_subscribers
-            WHERE owner_id = ?
-            """,
-            (owner_id,),
-        )
-        row = await cursor.fetchone()
-        return int(row["c"])
-
-    async def get_unnotified_subscribers(
-        self,
-        *,
-        owner_id: int,
-        cycle_at: str,
-    ) -> list[int]:
-        cursor = await self.conn.execute(
-            """
-            SELECT s.user_id
-            FROM tenant_subscribers s
-            LEFT JOIN notification_log n
-                ON n.owner_id = s.owner_id
-               AND n.user_id = s.user_id
-               AND n.cycle_at = ?
-            WHERE s.owner_id = ?
-              AND n.user_id IS NULL
-            ORDER BY s.user_id
-            """,
-            (cycle_at, owner_id),
-        )
-        rows = await cursor.fetchall()
-        return [int(row["user_id"]) for row in rows]
-
-    async def mark_notification_sent(
-        self,
-        *,
-        owner_id: int,
-        cycle_at: str,
-        user_id: int,
-    ) -> None:
-        async with self._write_lock:
-            await self.conn.execute(
-                """
-                INSERT OR IGNORE INTO notification_log (
-                    owner_id,
-                    cycle_at,
-                    user_id,
-                    sent_at
+    async def active_subscriber_restriction_details(self, *, channel_id: int, user_id: int, now: datetime | None = None) -> tuple[str, datetime | None, str | None, bool] | None:
+        moment=now or utc_now()
+        sanction=await self.get_effective_subscriber_sanction(channel_id=channel_id,user_id=user_id,now=moment)
+        if sanction is not None:
+            action = str(sanction["action"])
+            if action == "rate_limit":
+                next_allowed = await self._rate_limit_next_allowed_at(
+                    sanction=sanction, channel_id=channel_id, user_id=user_id
                 )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    owner_id,
-                    cycle_at,
-                    user_id,
-                    dt_to_db(utc_now()),
-                ),
-            )
+                if next_allowed is None or next_allowed <= moment:
+                    return None
+                return "rate_limited", next_allowed, str(sanction["reason"]), bool(sanction["show_reason_to_subscriber"])
+            mapping={"permanent_block":"permanently_blocked","temporary_block":"blocked","mute":"muted"}
+            return mapping[action],dt_from_db(str(sanction["expires_at"])) if sanction["expires_at"] else None,str(sanction["reason"]),bool(sanction["show_reason_to_subscriber"])
+        restriction=await self.active_subscriber_restriction(channel_id=channel_id,user_id=user_id,now=moment)
+        if restriction is None:return None
+        state=await self.get_subscriber_moderation(channel_id=channel_id,user_id=user_id)
+        return restriction[0],restriction[1],state["sanction_reason"] if state else None,bool(state and state["show_reason_to_subscriber"])
+
+    async def update_subscriber_moderation(self, *, channel_id: int, user_id: int, rate_limit_seconds: int | None = None, muted_until: datetime | None = None, blocked_until: datetime | None = None, permanently_blocked: bool | None = None, marked_spam: bool | None = None, internal_note: str | None = None, sanction_reason: str | None = None, show_reason_to_subscriber: bool | None = None) -> None:
+        existing = await self.get_subscriber_moderation(channel_id=channel_id, user_id=user_id)
+        values = {
+            "rate_limit_seconds": rate_limit_seconds if rate_limit_seconds is not None else (existing["rate_limit_seconds"] if existing else None),
+            "muted_until": dt_to_db(muted_until) if muted_until else (existing["muted_until"] if existing else None),
+            "blocked_until": dt_to_db(blocked_until) if blocked_until else (existing["blocked_until"] if existing else None),
+            "permanently_blocked": int(permanently_blocked) if permanently_blocked is not None else (existing["permanently_blocked"] if existing else 0),
+            "marked_spam": int(marked_spam) if marked_spam is not None else (existing["marked_spam"] if existing else 0),
+            "internal_note": internal_note if internal_note is not None else (existing["internal_note"] if existing else None),
+            "sanction_reason": sanction_reason if sanction_reason is not None else (existing["sanction_reason"] if existing else None),
+            "show_reason_to_subscriber": int(show_reason_to_subscriber) if show_reason_to_subscriber is not None else (existing["show_reason_to_subscriber"] if existing else 0),
+        }
+        async with self._write_lock:
+            await self.conn.execute("""INSERT INTO channel_subscriber_moderation(channel_id,user_id,rate_limit_seconds,muted_until,blocked_until,permanently_blocked,marked_spam,internal_note,sanction_reason,show_reason_to_subscriber,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(channel_id,user_id) DO UPDATE SET rate_limit_seconds=excluded.rate_limit_seconds,muted_until=excluded.muted_until,blocked_until=excluded.blocked_until,permanently_blocked=excluded.permanently_blocked,marked_spam=excluded.marked_spam,internal_note=excluded.internal_note,sanction_reason=excluded.sanction_reason,show_reason_to_subscriber=excluded.show_reason_to_subscriber,updated_at=excluded.updated_at""", (channel_id, user_id, values["rate_limit_seconds"], values["muted_until"], values["blocked_until"], values["permanently_blocked"], values["marked_spam"], values["internal_note"], values["sanction_reason"], values["show_reason_to_subscriber"], dt_to_db(utc_now())))
+            await self.conn.commit()
+    async def create_topic_mapping(self,*,channel_id:int,user_id:int,group_id:int,topic_id:int,privacy_mode:str="identified")->None:
+        now=dt_to_db(utc_now())
+        async with self._write_lock: await self.conn.execute("INSERT INTO channel_topics(channel_id,user_id,privacy_mode,group_id,topic_id,created_at,last_activity_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(channel_id,user_id,privacy_mode) DO UPDATE SET group_id=excluded.group_id,topic_id=excluded.topic_id,created_at=excluded.created_at,last_activity_at=excluded.last_activity_at",(channel_id,user_id,privacy_mode,group_id,topic_id,now,now)); await self.conn.commit()
+    async def touch_topic(self,*,channel_id:int,user_id:int,privacy_mode:str="identified")->None:
+        async with self._write_lock: await self.conn.execute("UPDATE channel_topics SET last_activity_at=? WHERE channel_id=? AND user_id=? AND privacy_mode=?",(dt_to_db(utc_now()),channel_id,user_id,privacy_mode)); await self.conn.commit()
+    async def delete_topic_mapping(self,*,channel_id:int,user_id:int,privacy_mode:str="identified")->None:
+        async with self._write_lock: await self.conn.execute("DELETE FROM channel_topics WHERE channel_id=? AND user_id=? AND privacy_mode=?",(channel_id,user_id,privacy_mode)); await self.conn.commit()
+    async def set_channel_cleanup_policy(self, *, channel_id: int, basis: str, status_scope: str, action: str, final_delete_days: int = 7) -> None:
+        if basis not in {"created_at", "last_activity_at"}:
+            raise ValueError("Invalid cleanup basis")
+        if status_scope not in {"all", "answered_closed"}:
+            raise ValueError("Invalid cleanup status scope")
+        if action not in {"delete", "close", "close_then_delete"}:
+            raise ValueError("Invalid cleanup action")
+        if final_delete_days < 1:
+            raise ValueError("Final deletion delay must be positive")
+        await self._update_channel_cleanup_policy(channel_id, basis, status_scope, action, final_delete_days)
+
+    async def _update_channel_cleanup_policy(self, channel_id: int, basis: str, status_scope: str, action: str, final_delete_days: int) -> None:
+        async with self._write_lock:
+            await self.conn.execute("UPDATE channels SET cleanup_basis=?, cleanup_status_scope=?, cleanup_action=?, cleanup_final_delete_days=?, updated_at=? WHERE channel_id=?", (basis, status_scope, action, final_delete_days, dt_to_db(utc_now()), channel_id))
             await self.conn.commit()
 
-    # ------------------------------------------------------------------
-    # Topics
-    # ------------------------------------------------------------------
+    async def topics_due_for_auto_cleanup(self, *, channel, cutoff: datetime, now: datetime) -> tuple[list[sqlite3.Row], list[sqlite3.Row]]:
+        channel_id = int(channel["channel_id"])
+        basis = str(channel["cleanup_basis"])
+        scope = str(channel["cleanup_status_scope"])
+        action = str(channel["cleanup_action"])
+        basis_column = "created_at" if basis == "created_at" else "last_activity_at"
+        status_filter = "" if scope == "all" else " AND status IN ('answered', 'closed')"
+        eligible = "status != 'in_progress' AND is_important = 0 AND is_pinned = 0"
+        close_rows: list[sqlite3.Row] = []
+        delete_rows: list[sqlite3.Row] = []
+        if action in {"delete", "close"}:
+            cursor = await self.conn.execute(f"SELECT * FROM channel_topics WHERE channel_id=? AND {basis_column}<? AND {eligible}{status_filter} AND auto_closed_at IS NULL ORDER BY {basis_column}", (channel_id, dt_to_db(cutoff)))
+            rows = await cursor.fetchall()
+            if action == "delete": delete_rows = rows
+            else: close_rows = rows
+        else:
+            cursor = await self.conn.execute(f"SELECT * FROM channel_topics WHERE channel_id=? AND {basis_column}<? AND {eligible}{status_filter} AND auto_closed_at IS NULL ORDER BY {basis_column}", (channel_id, dt_to_db(cutoff)))
+            close_rows = await cursor.fetchall()
+            final_cutoff = now - timedelta(days=int(channel["cleanup_final_delete_days"]))
+            cursor = await self.conn.execute(f"SELECT * FROM channel_topics WHERE channel_id=? AND auto_closed_at<? AND {eligible}{status_filter} ORDER BY auto_closed_at", (channel_id, dt_to_db(final_cutoff)))
+            delete_rows = await cursor.fetchall()
+        return close_rows, delete_rows
 
-    async def get_topic_for_user(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-    ) -> sqlite3.Row | None:
-        cursor = await self.conn.execute(
-            """
-            SELECT *
-            FROM topics
-            WHERE owner_id = ? AND user_id = ?
-            """,
-            (owner_id, user_id),
-        )
-        return await cursor.fetchone()
-
-    async def get_topic_by_group_thread(
-        self,
-        *,
-        group_id: int,
-        topic_id: int,
-    ) -> sqlite3.Row | None:
-        cursor = await self.conn.execute(
-            """
-            SELECT *
-            FROM topics
-            WHERE group_id = ? AND topic_id = ?
-            """,
-            (group_id, topic_id),
-        )
-        return await cursor.fetchone()
-
-    async def create_topic_mapping(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-        group_id: int,
-        topic_id: int,
-    ) -> None:
-        now = dt_to_db(utc_now())
-
+    async def mark_topic_auto_closed(self, *, channel_id: int, user_id: int, privacy_mode: str, closed_at: datetime | None = None) -> None:
         async with self._write_lock:
             await self.conn.execute(
-                """
-                INSERT INTO topics (
-                    owner_id,
-                    user_id,
-                    group_id,
-                    topic_id,
-                    created_at,
-                    last_activity_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(owner_id, user_id) DO UPDATE SET
-                    group_id = excluded.group_id,
-                    topic_id = excluded.topic_id,
-                    created_at = excluded.created_at,
-                    last_activity_at = excluded.last_activity_at
-                """,
-                (
-                    owner_id,
-                    user_id,
-                    group_id,
-                    topic_id,
-                    now,
-                    now,
-                ),
+                "UPDATE channel_topics SET auto_closed_at=?, status='closed' WHERE channel_id=? AND user_id=? AND privacy_mode=?",
+                (dt_to_db(closed_at or utc_now()), channel_id, user_id, privacy_mode),
             )
             await self.conn.commit()
 
-    async def touch_topic(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-    ) -> None:
-        async with self._write_lock:
-            await self.conn.execute(
-                """
-                UPDATE topics
-                SET last_activity_at = ?
-                WHERE owner_id = ? AND user_id = ?
-                """,
-                (dt_to_db(utc_now()), owner_id, user_id),
-            )
-            await self.conn.commit()
-
-    async def delete_topic_mapping(
-        self,
-        *,
-        owner_id: int,
-        user_id: int,
-    ) -> None:
-        async with self._write_lock:
-            await self.conn.execute(
-                """
-                DELETE FROM topics
-                WHERE owner_id = ? AND user_id = ?
-                """,
-                (owner_id, user_id),
-            )
-            await self.conn.commit()
-
-    async def topics_created_before(
-        self,
-        *,
-        owner_id: int,
-        cutoff: datetime,
-    ) -> list[sqlite3.Row]:
-        cursor = await self.conn.execute(
-            """
-            SELECT *
-            FROM topics
-            WHERE owner_id = ?
-              AND created_at < ?
-            ORDER BY created_at ASC
-            """,
-            (owner_id, dt_to_db(cutoff)),
-        )
+    async def topics_created_before(self, *, channel_id: int, cutoff: datetime) -> list[sqlite3.Row]:
+        cursor = await self.conn.execute("SELECT * FROM channel_topics WHERE channel_id=? AND created_at<? AND status != 'in_progress' AND is_important=0 AND is_pinned=0 ORDER BY created_at", (channel_id, dt_to_db(cutoff)))
         return await cursor.fetchall()
+    async def set_topic_status(self, *, channel_id:int, user_id:int, privacy_mode:str, status:str) -> bool:
+        if status not in {"new","in_progress","answered","closed"}: raise ValueError("Invalid topic status")
+        async with self._write_lock:
+            cursor=await self.conn.execute("UPDATE channel_topics SET status=? WHERE channel_id=? AND user_id=? AND privacy_mode=?",(status,channel_id,user_id,privacy_mode))
+            await self.conn.commit(); return cursor.rowcount == 1
 
-    async def count_tenant_topics(self, owner_id: int) -> int:
-        cursor = await self.conn.execute(
-            """
-            SELECT COUNT(*) AS c
-            FROM topics
-            WHERE owner_id = ?
-            """,
-            (owner_id,),
+    async def mark_topic_answered(self, *, channel_id: int, user_id: int, privacy_mode: str) -> bool:
+        """Auto-mark a conversation answered without reopening a manually closed case."""
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "UPDATE channel_topics SET status='answered' WHERE channel_id=? AND user_id=? AND privacy_mode=? AND status!='closed'",
+                (channel_id, user_id, privacy_mode),
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+    async def set_topic_cleanup_protection(self, *, channel_id: int, user_id: int, privacy_mode: str, important: bool | None = None, pinned: bool | None = None) -> bool:
+        if important is None and pinned is None:
+            raise ValueError("At least one protection flag is required")
+        fields: list[str] = []
+        values: list[int] = []
+        if important is not None:
+            fields.append("is_important = ?")
+            values.append(int(important))
+        if pinned is not None:
+            fields.append("is_pinned = ?")
+            values.append(int(pinned))
+        values.extend((channel_id, user_id, privacy_mode))
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                f"UPDATE channel_topics SET {', '.join(fields)} WHERE channel_id = ? AND user_id = ? AND privacy_mode = ?",
+                values,
+            )
+            await self.conn.commit()
+            return cursor.rowcount == 1
+
+    async def record_message_event(self, *, channel_id:int, user_id:int, privacy_mode:str, direction:str, message_type:str, occurred_at:datetime, source_chat_id:int, source_message_id:int, admin_id:int|None=None, media_group_id:str|None=None, conversation_id:int|None=None) -> None:
+        if privacy_mode not in {"identified", "anonymous"}: raise ValueError("Invalid privacy mode")
+        if direction not in {"subscriber_to_admin", "admin_to_subscriber"}: raise ValueError("Invalid event direction")
+        async with self._write_lock:
+            await self.conn.execute("INSERT OR IGNORE INTO message_events(channel_id,user_id,privacy_mode,direction,message_type,occurred_at,source_chat_id,source_message_id,admin_id,media_group_id,conversation_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)",(channel_id,user_id,privacy_mode,direction,message_type,dt_to_db(occurred_at),source_chat_id,source_message_id,admin_id,media_group_id,conversation_id))
+            await self.conn.commit()
+
+    async def get_subscriber_statistics(self, *, channel_id: int, user_id: int, timezone_name: str, now: datetime | None = None) -> dict[str, object]:
+        moment=now or utc_now(); channel=await self.get_channel_by_id(channel_id)
+        if channel is None: raise ValueError("Unknown channel")
+        subscriber=await (await self.conn.execute("SELECT * FROM channel_subscribers WHERE channel_id=? AND user_id=?",(channel_id,user_id))).fetchone()
+        if subscriber is None: raise ValueError("Unknown channel subscriber")
+        events=await (await self.conn.execute("SELECT * FROM message_events WHERE channel_id=? AND user_id=? ORDER BY occurred_at,event_id",(channel_id,user_id))).fetchall()
+        incoming=[e for e in events if e['direction']=='subscriber_to_admin']; outgoing=[e for e in events if e['direction']=='admin_to_subscriber']
+        local_zone=ZoneInfo(timezone_name)
+        media={key:0 for key in ('text','photo','video','document','voice','audio','sticker','other')}
+        for e in incoming: media[e['message_type'] if e['message_type'] in media else 'other']+=1
+        conversation_ids={int(e['conversation_id']) for e in events if e['conversation_id'] is not None}
+        topics=await (await self.conn.execute("SELECT status,topic_id FROM channel_topics WHERE channel_id=? AND user_id=?",(channel_id,user_id))).fetchall()
+        conversation_count=max(len(conversation_ids),len(topics))
+        answered_ids={int(e['conversation_id']) for e in outgoing if e['conversation_id'] is not None}
+        if not conversation_ids: answered_count=sum(1 for row in topics if row['status'] in ('answered','closed'))
+        else: answered_count=len(answered_ids)
+        closed_count=sum(1 for row in topics if row['status']=='closed')
+        first_responses=[]
+        for cid in conversation_ids:
+            received=[dt_from_db(e['occurred_at']) for e in incoming if e['conversation_id']==cid]
+            replies=[dt_from_db(e['occurred_at']) for e in outgoing if e['conversation_id']==cid]
+            if received and replies:
+                after=[r for r in replies if r>=min(received)]
+                if after: first_responses.append((min(after)-min(received)).total_seconds())
+        active_days={dt_from_db(e['occurred_at']).astimezone(local_zone).date() for e in incoming}
+        weekdays=[dt_from_db(e['occurred_at']).astimezone(local_zone).weekday() for e in incoming]
+        hours=[dt_from_db(e['occurred_at']).astimezone(local_zone).hour for e in incoming]
+        moderation=await self.list_moderation_actions(channel_id=channel_id,user_id=user_id)
+        active=await self.list_active_sanctions(channel_id=channel_id,user_id=user_id,now=moment)
+        return {'first_activity':subscriber['first_seen_at'],'last_activity':subscriber['last_seen_at'],'active_days':len(active_days),'subscriber_messages':len(incoming),'admin_replies':len(outgoing),'conversations':conversation_count,'answered_conversations':answered_count,'closed_conversations':closed_count,'average_messages_per_conversation':round(len(incoming)/conversation_count,2) if conversation_count else 0.0,'media':media,'average_first_response_seconds':round(sum(first_responses)/len(first_responses),2) if first_responses else None,'median_first_response_seconds':median(first_responses) if first_responses else None,'answered_percentage':round(answered_count*100/conversation_count,1) if conversation_count else 0.0,'last_7_days':sum(dt_from_db(e['occurred_at'])>=moment-timedelta(days=7) for e in incoming),'last_30_days':sum(dt_from_db(e['occurred_at'])>=moment-timedelta(days=30) for e in incoming),'active_weekday':max(set(weekdays),key=weekdays.count) if weekdays else None,'active_hour':max(set(hours),key=hours.count) if hours else None,'moderation':{'warnings':sum(r['action']=='warning' for r in moderation),'restrictions':sum(r['action'] in SANCTION_ACTIONS and r['action']!='warning' for r in moderation),'active_restrictions':len(active),'spam_marks':sum(r['action']=='mark_spam' for r in moderation),'notes':await self.count_subscriber_notes(channel_id=channel_id,user_id=user_id),'tags':await self.count_subscriber_tags(channel_id=channel_id,user_id=user_id)}}
+
+    async def get_channel_statistics(
+        self,
+        channel_id: int,
+        *,
+        period: str = "all",
+        now: datetime | None = None,
+    ) -> dict[str, object]:
+        """Return one channel-scoped, metadata-only statistics snapshot.
+
+        Conversation metrics intentionally use only events that have a known
+        conversation_id.  This keeps post-migration measurements honest when
+        older journal rows cannot be linked to a forum topic retrospectively.
+        """
+        if period not in {"today", "7d", "30d", "all"}:
+            raise ValueError("Unsupported statistics period")
+        channel = await self.get_channel_by_id(channel_id)
+        if channel is None:
+            raise ValueError("Unknown channel")
+
+        moment = (now or utc_now()).astimezone(timezone.utc)
+        local_zone = ZoneInfo(str(channel["timezone_name"]))
+        if period == "today":
+            local_now = moment.astimezone(local_zone)
+            start_utc = datetime.combine(
+                local_now.date(), datetime.min.time(), tzinfo=local_zone
+            ).astimezone(timezone.utc)
+        elif period == "7d":
+            start_utc = moment - timedelta(days=7)
+        elif period == "30d":
+            start_utc = moment - timedelta(days=30)
+        else:
+            start_utc = None
+
+        event_sql = "SELECT * FROM message_events WHERE channel_id = ? AND occurred_at <= ?"
+        parameters: list[object] = [channel_id, dt_to_db(moment)]
+        if start_utc is not None:
+            event_sql += " AND occurred_at >= ?"
+            parameters.append(dt_to_db(start_utc))
+        event_sql += " ORDER BY occurred_at ASC, event_id ASC"
+        events = await (await self.conn.execute(event_sql, parameters)).fetchall()
+        incoming = [row for row in events if row["direction"] == "subscriber_to_admin"]
+        outgoing = [row for row in events if row["direction"] == "admin_to_subscriber"]
+
+        def activity_cutoff(days: int) -> str:
+            return dt_to_db(moment - timedelta(days=days))
+
+        active_row = await (await self.conn.execute(
+            """SELECT
+                COUNT(DISTINCT CASE WHEN occurred_at >= ? THEN user_id END) AS active_1d,
+                COUNT(DISTINCT CASE WHEN occurred_at >= ? THEN user_id END) AS active_7d,
+                COUNT(DISTINCT CASE WHEN occurred_at >= ? THEN user_id END) AS active_30d
+               FROM message_events
+               WHERE channel_id = ? AND direction = 'subscriber_to_admin' AND occurred_at <= ?""",
+            (activity_cutoff(1), activity_cutoff(7), activity_cutoff(30), channel_id, dt_to_db(moment)),
+        )).fetchone()
+        unique_subscribers = await self.count_channel_subscribers(channel_id)
+
+        new_sql = "SELECT COUNT(*) AS count FROM channel_subscribers WHERE channel_id = ? AND first_seen_at <= ?"
+        new_parameters: list[object] = [channel_id, dt_to_db(moment)]
+        if start_utc is not None:
+            new_sql += " AND first_seen_at >= ?"
+            new_parameters.append(dt_to_db(start_utc))
+        new_subscribers = int((await (await self.conn.execute(new_sql, new_parameters)).fetchone())["count"])
+
+        incoming_by_conversation: dict[int, list[datetime]] = {}
+        outgoing_by_conversation: dict[int, list[datetime]] = {}
+        legacy_conversation_events = False
+        for row in events:
+            conversation_id = row["conversation_id"]
+            if conversation_id is None:
+                legacy_conversation_events = True
+                continue
+            target = (
+                incoming_by_conversation
+                if row["direction"] == "subscriber_to_admin"
+                else outgoing_by_conversation
+            )
+            target.setdefault(int(conversation_id), []).append(dt_from_db(row["occurred_at"]))
+
+        # A conversation begins with a subscriber message.  Replies that
+        # precede it, or belong to another conversation, cannot be responses.
+        conversation_ids = set(incoming_by_conversation)
+        response_seconds: list[float] = []
+        answered_conversations = 0
+        for conversation_id in conversation_ids:
+            first_subscriber_message = min(incoming_by_conversation[conversation_id])
+            replies_after_start = [
+                reply for reply in outgoing_by_conversation.get(conversation_id, [])
+                if reply >= first_subscriber_message
+            ]
+            if replies_after_start:
+                answered_conversations += 1
+                response_seconds.append(
+                    (min(replies_after_start) - first_subscriber_message).total_seconds()
+                )
+        conversation_count = len(conversation_ids)
+
+        media = {key: 0 for key in (
+            "text", "photo", "video", "document", "voice", "audio", "sticker", "other",
+        )}
+        media_item_types = {"photo", "video", "document", "voice", "audio", "sticker", "animation"}
+        album_ids: set[str] = set()
+        media_items_count = 0
+        messages_by_hour = {hour: 0 for hour in range(24)}
+        messages_by_weekday = {weekday: 0 for weekday in range(7)}
+        for row in incoming:
+            message_type = str(row["message_type"])
+            media[message_type if message_type in media else "other"] += 1
+            if message_type in media_item_types:
+                media_items_count += 1
+            if row["media_group_id"]:
+                album_ids.add(str(row["media_group_id"]))
+            local_time = dt_from_db(row["occurred_at"]).astimezone(local_zone)
+            messages_by_hour[local_time.hour] += 1
+            messages_by_weekday[local_time.weekday()] += 1
+        most_active_hour = (
+            min(messages_by_hour, key=lambda hour: (-messages_by_hour[hour], hour))
+            if incoming else None
         )
-        row = await cursor.fetchone()
-        return int(row["c"])
+        most_active_weekday = (
+            min(messages_by_weekday, key=lambda weekday: (-messages_by_weekday[weekday], weekday))
+            if incoming else None
+        )
+        top_subscribers = await self._build_channel_top_subscribers(
+            channel_id=channel_id,
+            incoming_events=incoming,
+        )
+
+        return {
+            "channel_id": channel_id,
+            "period": period,
+            "period_start_utc": dt_to_db(start_utc) if start_utc else None,
+            "timezone": str(channel["timezone_name"]),
+            "unique_subscribers": unique_subscribers,
+            "active_subscribers_1d": int(active_row["active_1d"] or 0),
+            "active_subscribers_7d": int(active_row["active_7d"] or 0),
+            "active_subscribers_30d": int(active_row["active_30d"] or 0),
+            "new_subscribers": new_subscribers,
+            "subscriber_messages": len(incoming),
+            "admin_replies": len(outgoing),
+            "average_messages_per_subscriber": (
+                round(len(incoming) / unique_subscribers, 2)
+                if unique_subscribers else 0.0
+            ),
+            "conversation_count": conversation_count,
+            "answered_conversation_count": answered_conversations,
+            "answered_conversation_share": (
+                round(answered_conversations * 100 / conversation_count, 1)
+                if conversation_count else 0.0
+            ),
+            "average_first_response_seconds": (
+                round(sum(response_seconds) / len(response_seconds), 2)
+                if response_seconds else None
+            ),
+            "median_first_response_seconds": (
+                median(response_seconds) if response_seconds else None
+            ),
+            "conversation_metrics_complete": not legacy_conversation_events,
+            "media": media,
+            "album_count": len(album_ids),
+            "media_items_count": media_items_count,
+            "messages_by_hour": messages_by_hour,
+            "messages_by_weekday": messages_by_weekday,
+            "most_active_hour": most_active_hour,
+            "most_active_weekday": most_active_weekday,
+            "top_subscribers": top_subscribers,
+        }
+
+    async def _build_channel_top_subscribers(
+        self,
+        *,
+        channel_id: int,
+        incoming_events: Sequence[sqlite3.Row],
+        limit: int = 5,
+    ) -> list[dict[str, object]]:
+        """Build presentation-safe Top-N data from already period-filtered events."""
+        counts: dict[tuple[int, str], int] = {}
+        first_event: dict[tuple[int, str], tuple[datetime, int]] = {}
+        for event in incoming_events:
+            key = (int(event["user_id"]), str(event["privacy_mode"]))
+            counts[key] = counts.get(key, 0) + 1
+            event_key = (dt_from_db(event["occurred_at"]), int(event["event_id"]))
+            if key not in first_event or event_key < first_event[key]:
+                first_event[key] = event_key
+        ordered = sorted(
+            counts,
+            key=lambda key: (-counts[key], first_event[key], key[1], key[0]),
+        )[:limit]
+        result: list[dict[str, object]] = []
+        for user_id, privacy_mode in ordered:
+            if privacy_mode == "anonymous":
+                tag = await self.get_anonymous_tag(channel_id=channel_id, user_id=user_id)
+                safe_tag = tag or "Анонимная подписчица"
+                result.append({
+                    "privacy_mode": "anonymous",
+                    "anonymous_tag": safe_tag,
+                    "display_name": safe_tag,
+                    "message_count": counts[(user_id, privacy_mode)],
+                })
+                continue
+            user = await (await self.conn.execute(
+                "SELECT first_name, last_name, username FROM users WHERE user_id=?",
+                (user_id,),
+            )).fetchone()
+            name_parts = [str(user["first_name"])] if user and user["first_name"] else []
+            if user and user["last_name"]:
+                name_parts.append(str(user["last_name"]))
+            display_name = " ".join(name_parts) or "Подписчица"
+            result.append({
+                "privacy_mode": "identified",
+                "display_name": display_name,
+                "message_count": counts[(user_id, privacy_mode)],
+            })
+        return result
+
+    async def get_channel_admin_statistics(self, channel_id: int, *, period: str = "all", now: datetime | None = None) -> dict[str, object]:
+        """Channel-scoped admin metrics from message and moderation metadata only."""
+        base = await self.get_channel_statistics(channel_id, period=period, now=now)
+        moment = (now or utc_now()).astimezone(timezone.utc)
+        start = base["period_start_utc"]
+        sql = "SELECT * FROM message_events WHERE channel_id=? AND occurred_at<=?"
+        params: list[object] = [channel_id, dt_to_db(moment)]
+        if start:
+            sql += " AND occurred_at>=?"; params.append(start)
+        sql += " ORDER BY occurred_at,event_id"
+        events = await (await self.conn.execute(sql, params)).fetchall()
+        replies = [r for r in events if r["direction"] == "admin_to_subscriber" and r["admin_id"] is not None]
+        moderation_sql = "SELECT * FROM moderation_log WHERE channel_id=? AND created_at<=?"
+        moderation_params: list[object] = [channel_id, dt_to_db(moment)]
+        if start:
+            moderation_sql += " AND created_at>=?"; moderation_params.append(start)
+        moderation = await (await self.conn.execute(moderation_sql, moderation_params)).fetchall()
+        metrics: dict[int, dict[str, object]] = {}
+        def row(admin_id: int) -> dict[str, object]:
+            return metrics.setdefault(admin_id, {"admin_id": admin_id, "reply_count": 0, "conversations_replied": set(), "first_response_count": 0, "first_response_samples": [], "moderation_actions": 0, "restrictions": 0, "warnings": 0, "spam_marks": 0, "management_actions": 0})
+        incoming: dict[int, list[datetime]] = {}
+        outgoing: dict[int, list[tuple[datetime, int]]] = {}
+        legacy = False
+        for event in events:
+            cid = event["conversation_id"]
+            if cid is None:
+                legacy = True; continue
+            if event["direction"] == "subscriber_to_admin":
+                incoming.setdefault(int(cid), []).append(dt_from_db(event["occurred_at"]))
+            elif event["admin_id"] is not None:
+                outgoing.setdefault(int(cid), []).append((dt_from_db(event["occurred_at"]), int(event["admin_id"])))
+        for reply in replies:
+            admin = row(int(reply["admin_id"])); admin["reply_count"] = int(admin["reply_count"]) + 1
+            if reply["conversation_id"] is not None: admin["conversations_replied"].add(int(reply["conversation_id"]))
+        for cid, received in incoming.items():
+            after = [(at, admin) for at, admin in outgoing.get(cid, []) if at >= min(received)]
+            if after:
+                at, admin_id = min(after, key=lambda item: (item[0], item[1]))
+                admin = row(admin_id); admin["first_response_count"] = int(admin["first_response_count"]) + 1
+                admin["first_response_samples"].append((at - min(received)).total_seconds())
+        restriction_actions = {"rate_limit", "mute", "temporary_block", "permanent_block"}
+        for action in moderation:
+            admin = row(int(action["admin_id"])); name = str(action["action"])
+            admin["moderation_actions"] = int(admin["moderation_actions"]) + 1
+            if name in restriction_actions: admin["restrictions"] = int(admin["restrictions"]) + 1
+            elif name == "warning": admin["warnings"] = int(admin["warnings"]) + 1
+            elif name == "mark_spam": admin["spam_marks"] = int(admin["spam_marks"]) + 1
+            else: admin["management_actions"] = int(admin["management_actions"]) + 1
+        result = []
+        for admin_id, item in metrics.items():
+            user = await (await self.conn.execute("SELECT first_name,last_name FROM users WHERE user_id=?", (admin_id,))).fetchone()
+            display = " ".join(str(user[key]) for key in ("first_name", "last_name") if user and user[key]) or "Бывший администратор"
+            samples = item.pop("first_response_samples")
+            conversations = item.pop("conversations_replied")
+            # A conversation is considered handled by the administrator who
+            # sent its first valid reply.  This gives one deterministic owner
+            # to every answered conversation without inventing responsibility
+            # for conversations that nobody answered.
+            item.update({
+                "display_name": display,
+                "unique_conversations_replied": len(conversations),
+                "handled_conversations": int(item["first_response_count"]),
+                "average_first_response_seconds": round(sum(samples)/len(samples),2) if samples else None,
+                "median_first_response_seconds": median(samples) if samples else None,
+            })
+            result.append(item)
+        result.sort(key=lambda item: (-int(item["reply_count"]), -int(item["first_response_count"]), int(item["admin_id"])))
+        team_samples = [sample for item in result for sample in ([] if item["average_first_response_seconds"] is None else [])]
+        # Rebuild exact team samples from conversations; per-admin rounded averages are not suitable.
+        exact_samples=[]
+        answered_conversation_count = 0
+        for cid, received in incoming.items():
+            after=[at for at, _ in outgoing.get(cid, []) if at >= min(received)]
+            if after:
+                answered_conversation_count += 1
+                exact_samples.append((min(after)-min(received)).total_seconds())
+        tracked_conversation_count = len(incoming)
+        unanswered_conversation_count = tracked_conversation_count - answered_conversation_count
+        return {
+            "channel_id": channel_id,
+            "period": period,
+            "admins": result,
+            "active_admin_count": len(result),
+            "admin_replies": len(replies),
+            "tracked_conversation_count": tracked_conversation_count,
+            "handled_conversation_count": answered_conversation_count,
+            "unanswered_conversation_count": unanswered_conversation_count,
+            "team_average_first_response_seconds": round(sum(exact_samples)/len(exact_samples),2) if exact_samples else None,
+            "team_median_first_response_seconds": median(exact_samples) if exact_samples else None,
+            "top_reply_admin": result[0]["display_name"] if result else None,
+            "top_first_response_admin": (sorted(result, key=lambda item: (-int(item["first_response_count"]), -int(item["reply_count"]), int(item["admin_id"])))[0]["display_name"] if result else None),
+            "conversation_metrics_complete": not legacy,
+        }
+
+    async def get_channel_export_snapshot(self, channel_id: int, *, period: str = "all", now: datetime | None = None) -> dict[str, object]:
+        """Return a single, channel-scoped metadata snapshot for future CSV/XLSX export.
+
+        This deliberately composes the established statistics APIs instead of
+        introducing independent export formulas or storing message content.
+        """
+        channel = await self.get_channel_by_id(channel_id)
+        if channel is None:
+            raise ValueError("Unknown channel")
+        generated_at = (now or utc_now()).astimezone(timezone.utc)
+        statistics = await self.get_channel_statistics(channel_id, period=period, now=generated_at)
+        administrators = await self.get_channel_admin_statistics(channel_id, period=period, now=generated_at)
+        return {
+            "channel_id": channel_id,
+            "period": period,
+            "metadata": {"channel_title": str(channel["group_title"]), "timezone": str(channel["timezone_name"]), "generated_at": dt_to_db(generated_at)},
+            "statistics": statistics,
+            "administrators": administrators,
+            "conversation_metrics_complete": bool(statistics["conversation_metrics_complete"]),
+        }
+
+    async def count_channel_topics(self,channel_id:int)->int: return int((await (await self.conn.execute("SELECT COUNT(*) AS c FROM channel_topics WHERE channel_id=?",(channel_id,))).fetchone())["c"])

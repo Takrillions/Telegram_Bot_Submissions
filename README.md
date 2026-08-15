@@ -1,117 +1,111 @@
-# Multi-tenant Telegram Feedback Bot
+# Multi-channel Telegram Feedback Bot
 
-Публичный бот-предложка на Python + aiogram 3.x.
+Публичный Telegram-бот обратной связи на Python и aiogram 3.x. Один экземпляр бота обслуживает несколько независимых каналов/супергрупп и хранит данные в SQLite.
 
-## Архитектура
+## Основная модель
 
-Один Telegram-бот обслуживает много независимых владельцев каналов.
+Владелец создаёт закрытую forum-супергруппу, добавляет бота администратором с `Manage Topics` и выполняет `/setup` из General. При первом подключении бот до создания `channel_id` просит задать префикс анонимных тегов (например, `Анон`); повторный `/setup` существующего канала этот префикс не меняет. Первый успешный setup фиксирует владельца конкретного `channel_id`; повторный setup не передаёт владение другому администратору.
 
-Каждый владелец:
-
-1. создаёт закрытую супергруппу;
-2. включает в ней **Темы / Forum Topics**;
-3. добавляет бота администратором;
-4. выдаёт боту право **Manage Topics**;
-5. желательно выдаёт **Delete Messages**;
-6. отправляет в группе `/setup`.
-
-Бот регистрирует tenant:
+Один владелец может подключить до пяти каналов. Подписчица может состоять сразу в нескольких каналах и выбирать активный через `/channels`. Deep-link нового формата:
 
 ```text
-owner_id <-> admin_group_id
+https://t.me/BOT_USERNAME?start=ref_c_CHANNEL_ID
 ```
 
-и выдаёт ссылку:
+Старый `ref_OWNER_ID` поддерживается только как совместимый вход, когда он однозначно разрешается в один канал.
+
+## Приватность и темы
+
+Для каждого канала подписчица выбирает отдельный режим:
+
+- `anonymous` — администраторы видят только анонимный тег;
+- `identified` — используется обычная карточка подписчицы.
+
+Anonymous и identified используют разные forum topics. Переключение режима не отправляет новые сообщения в старую ветку. Реальный Telegram `user_id` хранится только для внутренней маршрутизации и не выводится в анонимном интерфейсе.
+
+## Администраторы и права
+
+`channels.owner_id` — единственный источник истины для главного администратора канала. Обычные Telegram-администраторы могут работать в пользовательских ветках и выполнять разрешённую модерацию. Настройки канала, статистика, экспорт, массовая рассылка и конфигурация реакций доступны владельцу.
+
+Чувствительные действия повторно проверяют текущий Telegram admin status server-side; callback data не считается доказательством прав. Подробности: `docs/authorization-matrix.md`.
+
+## Основные возможности
+
+- multi-channel routing и channel-specific deep links;
+- anonymous/identified темы;
+- статусы обращений и защита тем от очистки;
+- rate-limit, mute, временная/постоянная блокировка, warning, spam-mark и снятие ограничений;
+- заметки, теги и история модерации;
+- статистика подписчицы, канала и администраторов;
+- privacy-safe поиск;
+- CSV/XLSX export;
+- channel-scoped редактор Telegram-реплик;
+- настраиваемые anonymous prefix/counter и карточки подписчиц;
+- глобальная карточка до Start;
+- массовая рассылка из General, включая albums;
+- два режима реакций администраторов;
+- автоматическая и ручная очистка forum topics;
+- локальные и внешние SQLite backup snapshots;
+- release-based deploy с readiness/rollback.
+
+## Команды
+
+В личном чате меню команд зависит от роли. Основные пользовательские команды:
 
 ```text
-https://t.me/BOT_USERNAME?start=ref_OWNER_ID
+/start
+/channels
+/privacy
 ```
 
-Подписчик, открывший ссылку, привязывается к этому tenant.
+Владелец дополнительно получает owner-команды, включая `/panel` и `/search`.
 
-Один подписчик может открывать ссылки нескольких владельцев.
-Последняя открытая ссылка становится его активной предложкой.
-Все прежние membership-связи сохраняются.
+В forum-супергруппе команды вводятся вручную. Bot API не умеет ограничивать command scope только темой General, поэтому групповое slash-меню намеренно не публикуется. Контекст каждой команды проверяется server-side. Подробности: `docs/telegram-command-scopes.md`.
 
-## Команды владельца в супергруппе
+## Настройка канала
 
-```text
-/setup
-/panel
-/set_period 30
-/set_announcement Ваш текст
-/set_timezone Asia/Tashkent
-```
+Основная точка управления — `/panel`. Там доступны существующие настройки канала, статистика/export, тексты, anonymous settings, cleanup, pre-Start card и другие owner-only функции.
 
-`/panel` показывает кнопку ручной очистки.
+Массовая рассылка запускается `/broadcast` только владельцем из General. Подробности: `docs/mass-broadcast.md`.
 
-## Ручная очистка
+Настройка реакций также выполняется владельцем из General. Подробности: `docs/reaction-routing.md`.
 
-Кнопка:
+## SQLite и миграции
 
-```text
-Очистить ветки до вчерашнего дня
-```
+База работает в WAL-режиме и обновляется последовательными versioned migrations. Перед миграцией существующей БД создаётся проверенный локальный snapshot. Запускайте только одну polling-реплику приложения с одной SQLite-базой.
 
-Реализована буквальная граница из ТЗ:
+Основные сущности включают:
 
-```text
-created_at < 00:00 вчерашнего дня
-```
+- channels и channel subscribers;
+- active channel/privacy state;
+- forum topic mappings;
+- message event journal;
+- sanctions/moderation metadata;
+- template overrides;
+- broadcasts/delivery journal;
+- reaction routing state;
+- pre-Start card state.
 
-Например, если локальная дата tenant — 11 августа, удаляются темы,
-созданные раньше 10 августа 00:00. Весь 10 и 11 августа сохраняются.
+## Переменные окружения
 
-Удаление выполняется через `deleteForumTopic`.
-Если Telegram не разрешает полное удаление, код пытается использовать
-`closeForumTopic`.
+Используйте `.env.example` как шаблон. Реальный `.env` не храните в Git.
 
-После успешного удаления/закрытия mapping темы удаляется из SQLite.
+Ключевые переменные:
 
-## Авто-сброс
-
-По умолчанию цикл — 30 дней.
-
-За 24 часа до `next_reset_at` APScheduler начинает рассылать кастомный
-текст всем подписчикам конкретного tenant.
-
-Каждая обработанная доставка записывается в `notification_log`.
-Это защищает от дублей после рестарта.
-
-Новые подписчики, появившиеся уже внутри 24-часового окна,
-также получают предупреждение на одном из следующих scheduler ticks.
-
-В момент сброса удаляются темы с:
-
-```text
-created_at < next_reset_at
-```
-
-То есть свежая тема, созданная уже после плановой точки сброса,
-не будет случайно удалена из-за небольшой задержки scheduler.
-
-Membership пользователей сохраняется, чтобы следующие предупреждения
-можно было отправлять всем подписчикам данного владельца.
-
-## SQLite
-
-Основные таблицы:
-
-- `tenants`
-- `users`
-- `tenant_subscribers`
-- `active_tenant`
-- `topics`
-- `notification_log`
-
-Для SQLite используется WAL.
-
-Важно: запускайте только **одну реплику** приложения с этой SQLite-базой.
-На хостинге база должна лежать на persistent volume/disk.
+- `BOT_TOKEN`;
+- `DATABASE_PATH`;
+- `DATABASE_BACKUP_DIR` / `DATABASE_BACKUP_KEEP`;
+- `DATABASE_REMOTE_BACKUP_BUCKET` / prefix / retention;
+- `DEFAULT_TIMEZONE`;
+- `DEFAULT_RESET_DAYS`;
+- `DEFAULT_NOTICE_TEXT`;
+- `SCHEDULER_CHECK_SECONDS`;
+- `MEDIA_GROUP_DELAY`;
+- `READINESS_PATH` и `RELEASE_ID` для production release layout.
 
 ## Локальный запуск
 
-Python 3.11+ рекомендуется.
+Рекомендуется Python 3.11+.
 
 ```bash
 python -m venv .venv
@@ -135,59 +129,29 @@ Copy-Item .env.example .env
 python main.py
 ```
 
-Заполните `BOT_TOKEN` в `.env`.
-
-## Права бота
-
-Минимум:
-
-- бот является администратором forum-супергруппы;
-- `can_manage_topics = true`.
-
-Для полного удаления веток вместе с их сообщениями:
-
-- `can_delete_messages = true`.
-
-Без `Delete Messages` setup не блокируется, но очистка может перейти
-на `closeForumTopic`.
-
-## Деплой
-
-Приложение использует long polling, поэтому отдельный HTTP-сервер не нужен.
-
-Команда запуска:
+Специальные режимы:
 
 ```bash
-python main.py
+python main.py --validate-release
+python main.py --migrate-only
 ```
 
-На Render/Railway/Fly.io/VPS выбирайте worker/background-service тип,
-если платформа его поддерживает.
-
-Критично:
-
-- один bot token = один работающий экземпляр polling;
-- SQLite-файл должен храниться на постоянном диске;
-- бесплатные хостинги, которые полностью останавливают worker или удаляют
-  файловую систему, не подходят для надёжного 30-дневного scheduler без
-  persistent storage.
-
-
-## Docker
-
-Сборка:
+## Тесты
 
 ```bash
-docker build -t telegram-feedback-bot .
+python -m unittest discover -v
 ```
 
-Запуск с постоянной SQLite-базой:
+Перед релизом также выполняются compile/static checks и проверка migration/deploy safety.
 
-```bash
-docker run --env-file .env \
-  -v "$(pwd)/data:/data" \
-  -e DATABASE_PATH=/data/feedback_bot.sqlite3 \
-  telegram-feedback-bot
-```
+## Production deploy и backup
 
-На Windows PowerShell путь к volume можно задать отдельно через Docker Desktop.
+Production использует release layout с общей `.env`, БД, backups и readiness state. Деплой выполняется через `.github/workflows/deploy.yml` и `scripts/deploy_release.sh`.
+
+Внешние backup snapshots предназначены для приватного Google Cloud Storage bucket вне основной VM. Инструкции и rollback-модель: `docs/backup-and-safe-deploy.md` и `docs/first-release-layout-transition.md`.
+
+Нельзя вручную менять production-схему или выполнять первый переход на release layout без отдельной проверки и явного разрешения.
+
+## Намеренно сохранённая совместимость
+
+Некоторые legacy/fallback пути остаются специально для безопасной миграции старой БД и обработки старых Telegram callbacks/deep-links. Их список и причины сохранения находятся в `docs/compatibility-inventory.md`.

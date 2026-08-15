@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram Bot Submissions
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=takrillions
+Group=takrillions
+WorkingDirectory=/home/takrillions/telegram-bot/current
+EnvironmentFile=/home/takrillions/telegram-bot/shared/.env
+EnvironmentFile=-/home/takrillions/telegram-bot/shared/runtime/release.env
+ExecStart=/home/takrillions/telegram-bot/current/.venv/bin/python /home/takrillions/telegram-bot/current/main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

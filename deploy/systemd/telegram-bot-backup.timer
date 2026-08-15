@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Telegram Bot SQLite backup
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+RandomizedDelaySec=900
+Unit=telegram-bot-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -9,10 +9,11 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
+from command_menu import sync_command_menus
 from database import Database
 from release_runtime import clear_readiness, write_readiness
 from handlers import FeedbackRuntime, TopicCleaner, register_handlers
-from scheduler import TenantScheduler
+from scheduler import ChannelScheduler
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +32,8 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        load_dotenv()
+        env_file = os.getenv("ENV_FILE", "").strip()
+        load_dotenv(env_file or None)
 
         token = os.getenv("BOT_TOKEN", "").strip()
         if not token:
@@ -116,11 +118,12 @@ async def main() -> None:
     await db.init()
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
+    await sync_command_menus(bot=bot, db=db)
     runtime = FeedbackRuntime(bot=bot, db=db, media_group_delay=settings.media_group_delay)
     cleaner = TopicCleaner(bot=bot, db=db)
     dp = Dispatcher()
     register_handlers(dispatcher=dp, bot=bot, db=db, runtime=runtime, cleaner=cleaner, settings=settings)
-    scheduler = TenantScheduler(bot=bot, db=db, cleaner=cleaner, check_seconds=settings.scheduler_check_seconds)
+    scheduler = ChannelScheduler(bot=bot, db=db, cleaner=cleaner, check_seconds=settings.scheduler_check_seconds)
     scheduler.start()
     await scheduler.tick()
 

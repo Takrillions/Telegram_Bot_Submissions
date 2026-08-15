@@ -1,0 +1,7 @@
+https://github.com/Takrillions/Telegram_Bot_Submissions/actions
+
+https://console.cloud.google.com/networking/networks/details/telegram-ipv6?project=project-6bd5d4f2-e1f7-4170-8cc&pageTab=FIREWALL_POLICIES
+
+https://console.cloud.google.com/networking/networks/details/telegram-ipv6?project=project-6bd5d4f2-e1f7-4170-8cc&pageTab=SUBNETS
+
+https://console.cloud.google.com/compute/instances?onCreate=true&project=project-6bd5d4f2-e1f7-4170-8cc&cloudshell=true
