@@ -164,6 +164,6 @@ grep -Fq "\"release_id\": \"$RELEASE_ID\"" "$READY"
   "from release_runtime import update_release_status,retain_releases; update_release_status('$RELEASE','ready', migration_applied=$MIGRATED); retain_releases('$ROOT', current_release='$RELEASE_ID')"
 
 sudo systemctl enable --now "$BACKUP_TIMER"
-rm -f "$ARCHIVE" /tmp/deploy_release.sh
 trap - ERR
+sudo rm -f -- "$ARCHIVE" /tmp/deploy_release.sh || true
 printf 'release ready: %s\n' "$RELEASE_ID"
