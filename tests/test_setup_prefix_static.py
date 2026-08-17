@@ -23,7 +23,7 @@ class SetupPrefixStaticTests(unittest.TestCase):
         registration = source[start:end]
         self.assertIn('anonymous_prefix: str = "Анон"', registration)
         self.assertIn("normalized_prefix = self.normalize_anonymous_prefix(anonymous_prefix)", registration)
-        self.assertIn("normalized_prefix))", registration)
+        self.assertIn("dt_to_db(next_reset), normalized_prefix,", registration)
         existing_branch = registration[: registration.index("count =")]
         self.assertNotIn("anonymous_prefix=?", existing_branch)
 

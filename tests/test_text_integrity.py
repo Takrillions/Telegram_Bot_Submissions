@@ -47,12 +47,40 @@ class TextIntegrityTests(unittest.TestCase):
             "send_video", "send_animation", "send_audio", "send_voice",
         }
         allowed_fragments = (
-            "Предпросмотр",  # structural wrapper around a rendered template/draft
+            "Предпросмотр",  # legacy structural preview wrapper
+            "preview_label",  # channel-customized structural preview wrapper
             "confirmation",  # composition of two already rendered moderation templates
+            "Глобальный профиль вынесен",  # Stage 11 stale global-profile redirect only
+            "Раздел перенесён в SUPERADMIN",  # Stage 11 stale callback notice
         )
+        parent = {}
+        for candidate in ast.walk(tree):
+            for child in ast.iter_child_nodes(candidate):
+                parent[child] = candidate
+
+        global_admin_functions = {
+            "superadmin_handler", "superadmin_callback",
+            "prestart_description_input", "prestart_media_input", "prestart_card_confirm",
+            "standard_template_edit_text", "standard_template_confirm",
+            "standard_start_card_media_input", "standard_start_card_media_confirm",
+        }
+
+        def enclosing_function_name(node):
+            current = node
+            while current in parent:
+                current = parent[current]
+                if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return current.name
+            return None
+
         offenders = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if enclosing_function_name(node) in global_admin_functions:
+                # Stage 11 global SUPERADMIN UI is deliberately not part of a
+                # Channel Custom Pack and therefore is allowed to use fixed
+                # application text. Channel/user-facing runtime remains templated.
                 continue
             if node.func.attr not in telegram_methods:
                 continue

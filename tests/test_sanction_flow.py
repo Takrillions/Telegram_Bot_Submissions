@@ -213,13 +213,13 @@ class SanctionFlowFoundationTests(unittest.IsolatedAsyncioTestCase):
             event="applied", seconds=120, until=__import__('database').utc_now(),
             reason=Database.resolve_sanction_reason("spam"), show_reason=False,
         ))
-        keyboard = sanction_duration_keyboard("rate_limit")
+        keyboard = await sanction_duration_keyboard(self.db, self.first_id, "rate_limit")
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         self.assertIn("sanction:param:rate_limit:300", callbacks)
         self.assertIn("sanction:param:rate_limit:custom", callbacks)
         self.assertFalse(any(value and value.startswith("sanction:param:rate:") for value in callbacks))
-        self.assertTrue(sanction_duration_keyboard("mute").inline_keyboard)
-        self.assertTrue(sanction_duration_keyboard("temporary_block").inline_keyboard)
+        self.assertTrue((await sanction_duration_keyboard(self.db, self.first_id, "mute")).inline_keyboard)
+        self.assertTrue((await sanction_duration_keyboard(self.db, self.first_id, "temporary_block")).inline_keyboard)
 
     async def test_custom_rate_limit_finalization_uses_reason_aware_db_api(self):
         data = self._complete_data(sanction_parameters={"rate_limit_seconds": 120})
@@ -598,7 +598,8 @@ class SanctionFlowFoundationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(other['subscriber_messages'],0)
         source=Path('handlers.py').read_text(encoding='utf-8')
         section=source[source.index('async def subscriber_statistics'):source.index('async def metadata_context')]
-        self.assertIn('get_subscriber_statistics(channel_id=',section)
+        self.assertIn('get_subscriber_statistics(', section)
+        self.assertIn('channel_id=cid', section)
         self.assertNotIn('first_name',section)
 
     async def test_moderation_history_is_ordered_channel_scoped_and_keeps_removed_events(self):

@@ -91,6 +91,10 @@ class FeedbackRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
             channel_id=5, group_id=-1001, forum_message_id=1010, user_id=42,
             privacy_mode="anonymous", private_chat_id=42, private_message_id=10, topic_id=77,
         )
+        bot.send_message.assert_awaited_once()
+        acknowledgement = bot.send_message.await_args.kwargs
+        self.assertEqual(acknowledgement["chat_id"], 42)
+        self.assertIn("получила ваше сообщение", acknowledgement["text"])
 
     async def test_admin_reply_reaches_subscriber_with_same_conversation_and_privacy(self):
         db = _db()
@@ -168,6 +172,9 @@ class FeedbackRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call.kwargs["conversation_id"], 88)
             self.assertEqual(call.kwargs["privacy_mode"], "identified")
             self.assertEqual(call.kwargs["media_group_id"], "album-1")
+        # A media group is one subscriber action, therefore only one acknowledgement.
+        bot.send_message.assert_awaited_once()
+        self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], 42)
 
     async def test_runtime_rechecks_active_restriction_before_forum_delivery(self):
         db = _db()

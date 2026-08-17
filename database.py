@@ -33,6 +33,14 @@ class DatabaseBackupError(DatabaseMigrationError):
     """A required pre-migration SQLite backup could not be verified."""
 
 
+class DraftConflictError(RuntimeError):
+    """A channel customization draft is based on a stale live revision."""
+
+
+class DraftNotEmptyError(RuntimeError):
+    """An operation requires an empty channel customization draft."""
+
+
 class SQLiteBackupManager:
     """Creates SQLite-aware local restore points for this application only."""
 
@@ -627,6 +635,807 @@ async def apply_channel_template_overrides(conn: aiosqlite.Connection) -> None:
     )""")
 
 
+
+CUSTOM_ITEM_TYPE_TEMPLATE_TEXT = "template_text"
+CUSTOM_ITEM_TYPE_LEGACY_TEMPLATE_OVERRIDE = "legacy_template_override"
+CUSTOM_ITEM_TYPE_START_CARD_MEDIA = "start_card_media"
+
+
+def _custom_text_payload(*, text: str, scope: str) -> str:
+    """Canonical JSON payload used by the customization foundation tables."""
+    return json.dumps(
+        {"scope": scope, "text": text},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+async def apply_custom_pack_foundation(conn: aiosqlite.Connection) -> None:
+    """Create immutable standard/channel customization snapshots.
+
+    Version 23 deliberately does not switch rendering away from
+    ``channel_template_overrides`` yet.  It seeds a complete immutable snapshot
+    for every existing channel and a global Standard Custom Pack so later
+    migrations can move editing to drafts/revisions without changing the live
+    Telegram behaviour in this release step.
+    """
+    await conn.execute("""CREATE TABLE bot_standard_custom_revisions (
+        revision_id INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        created_by INTEGER,
+        source TEXT NOT NULL,
+        summary TEXT
+    )""")
+    await conn.execute("""CREATE TABLE bot_standard_custom_items (
+        revision_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
+        item_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        PRIMARY KEY(revision_id, item_key),
+        FOREIGN KEY(revision_id) REFERENCES bot_standard_custom_revisions(revision_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_standard_custom_items_key ON bot_standard_custom_items(item_key, revision_id)")
+    await conn.execute("""CREATE TABLE bot_standard_custom_state (
+        singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+        active_revision_id INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER,
+        FOREIGN KEY(active_revision_id) REFERENCES bot_standard_custom_revisions(revision_id)
+    )""")
+
+    await conn.execute("""CREATE TABLE channel_custom_revisions (
+        revision_id INTEGER PRIMARY KEY,
+        channel_id INTEGER NOT NULL,
+        source TEXT NOT NULL,
+        source_standard_revision_id INTEGER,
+        created_at TEXT NOT NULL,
+        created_by INTEGER,
+        summary TEXT,
+        UNIQUE(revision_id, channel_id),
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(source_standard_revision_id) REFERENCES bot_standard_custom_revisions(revision_id)
+    )""")
+    await conn.execute("CREATE INDEX idx_channel_custom_revisions_channel_time ON channel_custom_revisions(channel_id, created_at, revision_id)")
+    await conn.execute("""CREATE TABLE channel_custom_items (
+        revision_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
+        item_type TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        PRIMARY KEY(revision_id, item_key),
+        FOREIGN KEY(revision_id) REFERENCES channel_custom_revisions(revision_id) ON DELETE CASCADE
+    )""")
+    await conn.execute("CREATE INDEX idx_channel_custom_items_key ON channel_custom_items(item_key, revision_id)")
+    await conn.execute("""CREATE TABLE channel_custom_state (
+        channel_id INTEGER PRIMARY KEY,
+        active_revision_id INTEGER NOT NULL,
+        initial_revision_id INTEGER NOT NULL,
+        source_standard_revision_id INTEGER,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(active_revision_id, channel_id) REFERENCES channel_custom_revisions(revision_id, channel_id),
+        FOREIGN KEY(initial_revision_id, channel_id) REFERENCES channel_custom_revisions(revision_id, channel_id),
+        FOREIGN KEY(source_standard_revision_id) REFERENCES bot_standard_custom_revisions(revision_id)
+    )""")
+
+    await conn.execute("""CREATE TABLE customization_audit_log (
+        event_id INTEGER PRIMARY KEY,
+        actor_user_id INTEGER,
+        scope_type TEXT NOT NULL CHECK(scope_type IN ('global_standard','channel_custom','global_profile')),
+        scope_id INTEGER NOT NULL,
+        channel_id INTEGER,
+        action TEXT NOT NULL,
+        target_key TEXT,
+        metadata_json TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        CHECK(
+            (scope_type = 'channel_custom' AND channel_id IS NOT NULL AND scope_id = channel_id)
+            OR (scope_type IN ('global_standard','global_profile') AND channel_id IS NULL AND scope_id = 1)
+        )
+    )""")
+    await conn.execute("CREATE INDEX idx_customization_audit_channel_time ON customization_audit_log(channel_id, created_at, event_id)")
+    await conn.execute("CREATE INDEX idx_customization_audit_scope_time ON customization_audit_log(scope_type, scope_id, created_at, event_id)")
+
+    # Import here to keep the low-level database module independent during
+    # module import. templates.py itself does not import database.py.
+    from templates import TEMPLATE_REGISTRY
+
+    now = dt_to_db(utc_now())
+    standard_cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "migration_seed", "Initial Standard Custom Pack from application template defaults"),
+    )
+    standard_revision_id = int(standard_cursor.lastrowid)
+    standard_items = []
+    for key, spec in sorted(TEMPLATE_REGISTRY.items()):
+        standard_items.append((
+            standard_revision_id,
+            f"template:{key}",
+            CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+            _custom_text_payload(text=spec.default, scope=spec.scope),
+        ))
+    if standard_items:
+        await conn.executemany(
+            "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+            standard_items,
+        )
+    await conn.execute(
+        "INSERT INTO bot_standard_custom_state(singleton_id,active_revision_id,updated_at,updated_by) VALUES(1,?,?,NULL)",
+        (standard_revision_id, now),
+    )
+    await conn.execute(
+        "INSERT INTO customization_audit_log(actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at) VALUES(NULL,'global_standard',1,NULL,'migration_seed',NULL,?,?)",
+        (json.dumps({"revision_id": standard_revision_id, "items": len(standard_items)}, sort_keys=True), now),
+    )
+
+    channels = await (await conn.execute("SELECT channel_id FROM channels ORDER BY channel_id")).fetchall()
+    for channel in channels:
+        channel_id = int(channel["channel_id"])
+        override_rows = await (await conn.execute(
+            "SELECT template_key,custom_text FROM channel_template_overrides WHERE channel_id=? ORDER BY template_key",
+            (channel_id,),
+        )).fetchall()
+        overrides = {str(row["template_key"]): str(row["custom_text"]) for row in override_rows}
+
+        revision_cursor = await conn.execute(
+            """INSERT INTO channel_custom_revisions(
+                   channel_id,source,source_standard_revision_id,created_at,created_by,summary
+               ) VALUES(?,?,?,?,NULL,?)""",
+            (channel_id, "migration_snapshot", standard_revision_id, now,
+             "Initial channel customization snapshot preserving current effective templates"),
+        )
+        revision_id = int(revision_cursor.lastrowid)
+        channel_items = []
+        known_keys = set()
+        for key, spec in sorted(TEMPLATE_REGISTRY.items()):
+            known_keys.add(key)
+            effective_text = overrides.get(key, spec.default)
+            channel_items.append((
+                revision_id,
+                f"template:{key}",
+                CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                _custom_text_payload(text=effective_text, scope=spec.scope),
+            ))
+        # Unknown/stale legacy overrides are not rendered by the current
+        # registry, but retaining them in the snapshot avoids silent data loss.
+        for key in sorted(set(overrides) - known_keys):
+            channel_items.append((
+                revision_id,
+                f"template:{key}",
+                CUSTOM_ITEM_TYPE_LEGACY_TEMPLATE_OVERRIDE,
+                _custom_text_payload(text=overrides[key], scope="unknown"),
+            ))
+        if channel_items:
+            await conn.executemany(
+                "INSERT INTO channel_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                channel_items,
+            )
+        await conn.execute(
+            """INSERT INTO channel_custom_state(
+                   channel_id,active_revision_id,initial_revision_id,source_standard_revision_id,updated_at,updated_by
+               ) VALUES(?,?,?,?,?,NULL)""",
+            (channel_id, revision_id, revision_id, standard_revision_id, now),
+        )
+        await conn.execute(
+            """INSERT INTO customization_audit_log(
+                   actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+               ) VALUES(NULL,'channel_custom',?,?, 'migration_seed',NULL,?,?)""",
+            (channel_id, channel_id,
+             json.dumps({
+                 "revision_id": revision_id,
+                 "source_standard_revision_id": standard_revision_id,
+                 "items": len(channel_items),
+                 "legacy_overrides": len(overrides),
+             }, sort_keys=True), now),
+        )
+
+async def apply_channel_start_card_media(conn: aiosqlite.Connection) -> None:
+    """Persist channel-scoped media for the post-Start welcome card.
+
+    The card text continues to use the existing ``start.greeting`` template,
+    which is already channel-scoped.  Media is deliberately stored separately
+    so it never mutates the global Telegram profile / Description Picture.
+    """
+    await conn.execute("""CREATE TABLE channel_start_card_media (
+        channel_id INTEGER PRIMARY KEY,
+        media_type TEXT NOT NULL CHECK(media_type IN ('photo','video','animation')),
+        media_file_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE
+    )""")
+
+    # Migration 23 seeded the Standard Pack from the registry that existed at
+    # that time. Version 24 adds new start-card UI keys. Keep immutable
+    # standard revisions immutable by creating a successor revision containing
+    # any newly introduced application defaults instead of mutating the old
+    # revision in place. Existing channel snapshots are intentionally untouched.
+    from templates import TEMPLATE_REGISTRY
+
+    state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if state is not None:
+        previous_revision_id = int(state["active_revision_id"])
+        rows = await (await conn.execute(
+            "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+            (previous_revision_id,),
+        )).fetchall()
+        existing_keys = {str(row["item_key"]) for row in rows}
+        missing = [
+            (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+            if f"template:{key}" not in existing_keys
+        ]
+        if missing:
+            now = dt_to_db(utc_now())
+            revision_cursor = await conn.execute(
+                "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+                (now, "schema_v24_defaults", "Add application defaults introduced with channel start cards"),
+            )
+            revision_id = int(revision_cursor.lastrowid)
+            await conn.execute(
+                """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+                   SELECT ?,item_key,item_type,payload_json
+                   FROM bot_standard_custom_items WHERE revision_id=?""",
+                (revision_id, previous_revision_id),
+            )
+            await conn.executemany(
+                "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                [
+                    (revision_id, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                     _custom_text_payload(text=spec.default, scope=spec.scope))
+                    for key, spec in missing
+                ],
+            )
+            await conn.execute(
+                "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+                (revision_id, now),
+            )
+            await conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+                (json.dumps({
+                    "previous_revision_id": previous_revision_id,
+                    "revision_id": revision_id,
+                    "added_items": len(missing),
+                }, sort_keys=True), now),
+            )
+
+
+async def apply_template_surface_v25(conn: aiosqlite.Connection) -> None:
+    """Extend only the global Standard Pack with Stage-6 template defaults.
+
+    Standard revisions are immutable. Existing channel snapshots must remain
+    byte-for-byte independent from later application defaults, so this
+    migration creates a successor Standard revision only when registry keys
+    are missing and never updates ``channel_custom_*`` rows.
+    """
+    from templates import TEMPLATE_REGISTRY
+
+    state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if state is None:
+        return
+
+    previous_revision_id = int(state["active_revision_id"])
+    rows = await (await conn.execute(
+        "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+        (previous_revision_id,),
+    )).fetchall()
+    existing_keys = {str(row["item_key"]) for row in rows}
+    missing = [
+        (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+        if f"template:{key}" not in existing_keys
+    ]
+    if not missing:
+        return
+
+    now = dt_to_db(utc_now())
+    revision_cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "schema_v25_defaults", "Add channel template surface introduced in Stage 6"),
+    )
+    revision_id = int(revision_cursor.lastrowid)
+    await conn.execute(
+        """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+           SELECT ?,item_key,item_type,payload_json
+           FROM bot_standard_custom_items WHERE revision_id=?""",
+        (revision_id, previous_revision_id),
+    )
+    await conn.executemany(
+        "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+        [
+            (revision_id, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+             _custom_text_payload(text=spec.default, scope=spec.scope))
+            for key, spec in missing
+        ],
+    )
+    await conn.execute(
+        "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+        (revision_id, now),
+    )
+    await conn.execute(
+        """INSERT INTO customization_audit_log(
+               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+           ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+        (json.dumps({
+            "previous_revision_id": previous_revision_id,
+            "revision_id": revision_id,
+            "added_items": len(missing),
+            "schema_version": 25,
+        }, sort_keys=True), now),
+    )
+
+
+async def apply_custom_drafts_v26(conn: aiosqlite.Connection) -> None:
+    """Add persistent per-channel drafts and consolidate the Stage-6 live overlay.
+
+    The migration preserves the exact effective live text/media state before the
+    new editor starts writing only to drafts. Legacy template overrides are
+    folded into a successor immutable revision and then cleared. Start-card
+    media is also represented inside the immutable revision while the legacy
+    table remains as a compatibility mirror for older runtime helpers.
+    """
+    await conn.execute("""CREATE TABLE channel_custom_drafts (
+        channel_id INTEGER PRIMARY KEY,
+        base_revision_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL,
+        FOREIGN KEY(channel_id) REFERENCES channels(channel_id) ON DELETE CASCADE,
+        FOREIGN KEY(base_revision_id, channel_id)
+            REFERENCES channel_custom_revisions(revision_id, channel_id)
+    )""")
+    await conn.execute("""CREATE TABLE channel_custom_draft_items (
+        channel_id INTEGER NOT NULL,
+        item_key TEXT NOT NULL,
+        operation TEXT NOT NULL CHECK(operation IN ('set','delete')),
+        item_type TEXT,
+        payload_json TEXT,
+        updated_at TEXT NOT NULL,
+        updated_by INTEGER NOT NULL,
+        PRIMARY KEY(channel_id, item_key),
+        FOREIGN KEY(channel_id) REFERENCES channel_custom_drafts(channel_id) ON DELETE CASCADE,
+        CHECK(
+            (operation='set' AND item_type IS NOT NULL AND payload_json IS NOT NULL)
+            OR (operation='delete' AND item_type IS NULL AND payload_json IS NULL)
+        )
+    )""")
+    await conn.execute(
+        "CREATE INDEX idx_channel_custom_draft_items_channel ON channel_custom_draft_items(channel_id,item_key)"
+    )
+
+    # Stage-7 introduces owner-facing draft/publish messages. Extend only the
+    # global Standard Pack; existing channel snapshots stay independent.
+    from templates import TEMPLATE_REGISTRY
+    standard_state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if standard_state is not None:
+        previous_standard_revision = int(standard_state["active_revision_id"])
+        standard_rows = await (await conn.execute(
+            "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+            (previous_standard_revision,),
+        )).fetchall()
+        existing_standard_keys = {str(row["item_key"]) for row in standard_rows}
+        missing = [
+            (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+            if f"template:{key}" not in existing_standard_keys
+        ]
+        if missing:
+            now = dt_to_db(utc_now())
+            cursor = await conn.execute(
+                "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+                (now, "schema_v26_defaults", "Add draft/publish UI introduced in Stage 7"),
+            )
+            new_standard_revision = int(cursor.lastrowid)
+            await conn.execute(
+                """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+                   SELECT ?,item_key,item_type,payload_json
+                   FROM bot_standard_custom_items WHERE revision_id=?""",
+                (new_standard_revision, previous_standard_revision),
+            )
+            await conn.executemany(
+                "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                [
+                    (new_standard_revision, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                     _custom_text_payload(text=spec.default, scope=spec.scope))
+                    for key, spec in missing
+                ],
+            )
+            await conn.execute(
+                "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+                (new_standard_revision, now),
+            )
+            await conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+                (json.dumps({
+                    "previous_revision_id": previous_standard_revision,
+                    "revision_id": new_standard_revision,
+                    "added_items": len(missing),
+                    "schema_version": 26,
+                }, sort_keys=True), now),
+            )
+
+    # Freeze the exact pre-v26 effective state into immutable revisions. This
+    # makes later live rendering independent from the mutable override table.
+    states = await (await conn.execute(
+        "SELECT * FROM channel_custom_state ORDER BY channel_id"
+    )).fetchall()
+    for state in states:
+        channel_id = int(state["channel_id"])
+        active_revision_id = int(state["active_revision_id"])
+        item_rows = await (await conn.execute(
+            "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=? ORDER BY item_key",
+            (active_revision_id,),
+        )).fetchall()
+        items = {
+            str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+            for row in item_rows
+        }
+        changed_keys: list[str] = []
+
+        override_rows = await (await conn.execute(
+            "SELECT template_key,custom_text FROM channel_template_overrides WHERE channel_id=? ORDER BY template_key",
+            (channel_id,),
+        )).fetchall()
+        for row in override_rows:
+            key = str(row["template_key"])
+            spec = TEMPLATE_REGISTRY.get(key)
+            item_key = f"template:{key}"
+            item_type = CUSTOM_ITEM_TYPE_TEMPLATE_TEXT if spec is not None else CUSTOM_ITEM_TYPE_LEGACY_TEMPLATE_OVERRIDE
+            payload = _custom_text_payload(
+                text=str(row["custom_text"]), scope=spec.scope if spec is not None else "unknown"
+            )
+            if items.get(item_key) != (item_type, payload):
+                items[item_key] = (item_type, payload)
+                changed_keys.append(item_key)
+
+        media = await (await conn.execute(
+            "SELECT media_type,media_file_id FROM channel_start_card_media WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+        if media is not None:
+            payload = json.dumps(
+                {"media_type": str(media["media_type"]), "media_file_id": str(media["media_file_id"])},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            if items.get("start_card.media") != (CUSTOM_ITEM_TYPE_START_CARD_MEDIA, payload):
+                items["start_card.media"] = (CUSTOM_ITEM_TYPE_START_CARD_MEDIA, payload)
+                changed_keys.append("start_card.media")
+
+        if changed_keys:
+            now = dt_to_db(utc_now())
+            cursor = await conn.execute(
+                """INSERT INTO channel_custom_revisions(
+                       channel_id,source,source_standard_revision_id,created_at,created_by,summary
+                   ) VALUES(?,?,?,?,NULL,?)""",
+                (
+                    channel_id,
+                    "stage7_live_snapshot",
+                    state["source_standard_revision_id"],
+                    now,
+                    "Consolidate live template/media state before draft-only editing",
+                ),
+            )
+            revision_id = int(cursor.lastrowid)
+            if items:
+                await conn.executemany(
+                    "INSERT INTO channel_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                    [(revision_id, key, item_type, payload) for key, (item_type, payload) in sorted(items.items())],
+                )
+            await conn.execute(
+                "UPDATE channel_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE channel_id=?",
+                (revision_id, now, channel_id),
+            )
+            await conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(NULL,'channel_custom',?,?, 'draft_foundation_migration',NULL,?,?)""",
+                (
+                    channel_id, channel_id,
+                    json.dumps({
+                        "previous_revision_id": active_revision_id,
+                        "revision_id": revision_id,
+                        "changed_keys": sorted(set(changed_keys)),
+                        "schema_version": 26,
+                    }, ensure_ascii=False, sort_keys=True),
+                    now,
+                ),
+            )
+        # This table remains only for compatibility with old migrations/tests;
+        # after v26 it is no longer the live owner-edit surface.
+        await conn.execute(
+            "DELETE FROM channel_template_overrides WHERE channel_id=?", (channel_id,)
+        )
+
+
+async def apply_custom_history_v27(conn: aiosqlite.Connection) -> None:
+    """Add rollback intent metadata to drafts and extend Standard UI defaults.
+
+    Existing channel revisions remain immutable and untouched. Existing drafts
+    become normal manual-publish drafts. A revision restore can later mark a
+    fresh draft as ``rollback`` so publication creates a new rollback revision
+    instead of rewriting history.
+    """
+    await conn.execute(
+        "ALTER TABLE channel_custom_drafts ADD COLUMN publish_source TEXT NOT NULL DEFAULT 'manual_publish'"
+    )
+    await conn.execute(
+        "ALTER TABLE channel_custom_drafts ADD COLUMN publish_summary TEXT"
+    )
+    await conn.execute(
+        "ALTER TABLE channel_custom_drafts ADD COLUMN restore_revision_id INTEGER"
+    )
+
+    from templates import TEMPLATE_REGISTRY
+    standard_state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if standard_state is None:
+        return
+    previous_revision = int(standard_state["active_revision_id"])
+    rows = await (await conn.execute(
+        "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+        (previous_revision,),
+    )).fetchall()
+    existing = {str(row["item_key"]) for row in rows}
+    missing = [
+        (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+        if f"template:{key}" not in existing
+    ]
+    if not missing:
+        return
+
+    now = dt_to_db(utc_now())
+    cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "schema_v27_defaults", "Add revision history, audit and rollback UI defaults"),
+    )
+    revision_id = int(cursor.lastrowid)
+    await conn.execute(
+        """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+           SELECT ?,item_key,item_type,payload_json
+           FROM bot_standard_custom_items WHERE revision_id=?""",
+        (revision_id, previous_revision),
+    )
+    await conn.executemany(
+        "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+        [
+            (revision_id, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+             _custom_text_payload(text=spec.default, scope=spec.scope))
+            for key, spec in missing
+        ],
+    )
+    await conn.execute(
+        "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+        (revision_id, now),
+    )
+    await conn.execute(
+        """INSERT INTO customization_audit_log(
+               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+           ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+        (json.dumps({
+            "previous_revision_id": previous_revision,
+            "revision_id": revision_id,
+            "added_items": len(missing),
+            "schema_version": 27,
+        }, sort_keys=True), now),
+    )
+
+
+async def apply_custom_tools_v28(conn: aiosqlite.Connection) -> None:
+    """Add bulk customization draft provenance and Stage-9 UI defaults.
+
+    Existing channel live revisions remain untouched.  New nullable metadata on
+    drafts records where a bulk reset/apply/copy operation came from so the
+    resulting immutable revision and audit log preserve useful provenance.
+    """
+    await conn.execute(
+        "ALTER TABLE channel_custom_drafts ADD COLUMN source_channel_id INTEGER"
+    )
+    await conn.execute(
+        "ALTER TABLE channel_custom_drafts ADD COLUMN source_standard_revision_id INTEGER"
+    )
+
+    from templates import TEMPLATE_REGISTRY
+    standard_state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if standard_state is None:
+        return
+    previous_revision = int(standard_state["active_revision_id"])
+    rows = await (await conn.execute(
+        "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+        (previous_revision,),
+    )).fetchall()
+    existing = {str(row["item_key"]) for row in rows}
+    missing = [
+        (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+        if f"template:{key}" not in existing
+    ]
+    if not missing:
+        return
+
+    now = dt_to_db(utc_now())
+    cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "schema_v28_defaults", "Add reset, current-standard and own-channel copy UI defaults"),
+    )
+    revision_id = int(cursor.lastrowid)
+    await conn.execute(
+        """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+           SELECT ?,item_key,item_type,payload_json
+           FROM bot_standard_custom_items WHERE revision_id=?""",
+        (revision_id, previous_revision),
+    )
+    await conn.executemany(
+        "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+        [
+            (revision_id, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+             _custom_text_payload(text=spec.default, scope=spec.scope))
+            for key, spec in missing
+        ],
+    )
+    await conn.execute(
+        "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+        (revision_id, now),
+    )
+    await conn.execute(
+        """INSERT INTO customization_audit_log(
+               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+           ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+        (json.dumps({
+            "previous_revision_id": previous_revision,
+            "revision_id": revision_id,
+            "added_items": len(missing),
+            "schema_version": 28,
+        }, sort_keys=True), now),
+    )
+
+
+async def apply_custom_transfer_v29(conn: aiosqlite.Connection) -> None:
+    """Add Stage-10 import/export UI defaults without touching channel snapshots.
+
+    Export/import needs no new mutable persistence: existing drafts, immutable
+    revisions and audit rows already provide the required safety model.  This
+    migration only advances the current Standard Custom Pack when new
+    channel-scoped UI/template keys were introduced by Stage 10. Existing
+    channels intentionally keep their prior immutable snapshots.
+    """
+    from templates import TEMPLATE_REGISTRY
+
+    standard_state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if standard_state is None:
+        return
+    previous_revision = int(standard_state["active_revision_id"])
+    rows = await (await conn.execute(
+        "SELECT item_key FROM bot_standard_custom_items WHERE revision_id=?",
+        (previous_revision,),
+    )).fetchall()
+    existing = {str(row["item_key"]) for row in rows}
+    missing = [
+        (key, spec) for key, spec in sorted(TEMPLATE_REGISTRY.items())
+        if f"template:{key}" not in existing
+    ]
+    if not missing:
+        return
+
+    now = dt_to_db(utc_now())
+    cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "schema_v29_defaults", "Add safe Channel Custom Pack import/export UI defaults"),
+    )
+    revision_id = int(cursor.lastrowid)
+    await conn.execute(
+        """INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json)
+           SELECT ?,item_key,item_type,payload_json
+           FROM bot_standard_custom_items WHERE revision_id=?""",
+        (revision_id, previous_revision),
+    )
+    await conn.executemany(
+        "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+        [
+            (revision_id, f"template:{key}", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+             _custom_text_payload(text=spec.default, scope=spec.scope))
+            for key, spec in missing
+        ],
+    )
+    await conn.execute(
+        "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+        (revision_id, now),
+    )
+    await conn.execute(
+        """INSERT INTO customization_audit_log(
+               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+           ) VALUES(NULL,'global_standard',1,NULL,'schema_defaults_added',NULL,?,?)""",
+        (json.dumps({
+            "previous_revision_id": previous_revision,
+            "revision_id": revision_id,
+            "added_items": len(missing),
+            "schema_version": 29,
+        }, sort_keys=True), now),
+    )
+
+
+async def apply_standard_global_separation_v30(conn: aiosqlite.Connection) -> None:
+    """Make the active Standard Custom Pack strictly channel-scoped.
+
+    Earlier foundation migrations intentionally mirrored the whole template
+    registry into the Standard Pack, including global setup/pre-start texts.
+    Stage 11 finalizes the model: global bot-profile UI stays application/global
+    state, while the active Standard revision contains only channel-scoped
+    templates plus the optional default Channel Start Card media item.
+
+    Historical Standard revisions and every existing Channel Custom Pack remain
+    immutable and untouched.
+    """
+    from templates import TEMPLATE_REGISTRY
+
+    state = await (await conn.execute(
+        "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+    )).fetchone()
+    if state is None:
+        return
+    previous_revision = int(state["active_revision_id"])
+    rows = await (await conn.execute(
+        "SELECT item_key,item_type,payload_json FROM bot_standard_custom_items WHERE revision_id=? ORDER BY item_key",
+        (previous_revision,),
+    )).fetchall()
+
+    allowed_template_keys = {
+        f"template:{key}" for key, spec in TEMPLATE_REGISTRY.items() if spec.scope == "channel"
+    }
+    kept: list[tuple[str, str, str]] = []
+    removed: list[str] = []
+    for row in rows:
+        item_key = str(row["item_key"])
+        if item_key in allowed_template_keys or item_key == "start_card.media":
+            kept.append((item_key, str(row["item_type"]), str(row["payload_json"])))
+        else:
+            removed.append(item_key)
+
+    # Even if a legacy fixture is already clean, record no redundant revision.
+    if not removed:
+        return
+
+    now = dt_to_db(utc_now())
+    cursor = await conn.execute(
+        "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,NULL,?,?)",
+        (now, "schema_v30_scope_separation", "Remove global bot/profile items from active Standard Custom Pack"),
+    )
+    revision_id = int(cursor.lastrowid)
+    if kept:
+        await conn.executemany(
+            "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+            [(revision_id, item_key, item_type, payload_json) for item_key, item_type, payload_json in kept],
+        )
+    await conn.execute(
+        "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=NULL WHERE singleton_id=1",
+        (revision_id, now),
+    )
+    await conn.execute(
+        """INSERT INTO customization_audit_log(
+               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+           ) VALUES(NULL,'global_standard',1,NULL,'standard_scope_separated',NULL,?,?)""",
+        (json.dumps({
+            "previous_revision_id": previous_revision,
+            "revision_id": revision_id,
+            "removed_items": len(removed),
+            "removed_keys": removed,
+            "schema_version": 30,
+        }, ensure_ascii=False, sort_keys=True), now),
+    )
+
+
 async def apply_anonymous_cycle_state(conn: aiosqlite.Connection) -> None:
     """Decouple anonymous numbering cycles from cleanup schedule edits."""
     await conn.execute("ALTER TABLE channel_anonymous_counters RENAME TO legacy_channel_anonymous_counters")
@@ -774,6 +1583,14 @@ DEFAULT_MIGRATIONS = (
     Migration(20, "mass_broadcasts", apply_mass_broadcasts),
     Migration(21, "reaction_routing", apply_reaction_routing),
     Migration(22, "broadcast_album_sources", apply_broadcast_album_sources),
+    Migration(23, "custom_pack_foundation", apply_custom_pack_foundation),
+    Migration(24, "channel_start_card_media", apply_channel_start_card_media),
+    Migration(25, "template_surface_v25", apply_template_surface_v25),
+    Migration(26, "channel_custom_drafts", apply_custom_drafts_v26),
+    Migration(27, "custom_history_and_rollback", apply_custom_history_v27),
+    Migration(28, "custom_tools_and_provenance", apply_custom_tools_v28),
+    Migration(29, "custom_transfer_json", apply_custom_transfer_v29),
+    Migration(30, "standard_global_separation", apply_standard_global_separation_v30),
 )
 CURRENT_SCHEMA_VERSION = DEFAULT_MIGRATIONS[-1].version
 
@@ -1167,16 +1984,1836 @@ class Database:
         rows = await (await self.conn.execute("SELECT template_key FROM channel_template_overrides WHERE channel_id=? ORDER BY template_key", (channel_id,))).fetchall()
         return {str(row["template_key"]) for row in rows}
 
+
+    # ------------------------------------------------------------------
+    # Custom Pack foundation (schema v23).
+    # Rendering still uses channel_template_overrides in this stage.  These
+    # APIs expose immutable standard/channel snapshots and an optional overlay
+    # of the legacy live overrides so subsequent stages can migrate safely.
+    # ------------------------------------------------------------------
+    async def get_standard_custom_state(self) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM bot_standard_custom_state WHERE singleton_id=1"
+        )).fetchone()
+
+    async def get_standard_custom_items(self, *, revision_id: int | None = None) -> dict[str, dict[str, object]]:
+        if revision_id is None:
+            state = await self.get_standard_custom_state()
+            if state is None:
+                return {}
+            revision_id = int(state["active_revision_id"])
+        rows = await (await self.conn.execute(
+            "SELECT item_key,item_type,payload_json FROM bot_standard_custom_items WHERE revision_id=? ORDER BY item_key",
+            (revision_id,),
+        )).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {"raw": str(row["payload_json"])}
+            result[str(row["item_key"])] = {
+                "item_type": str(row["item_type"]),
+                "payload": payload,
+            }
+        return result
+
+    async def get_standard_custom_revision(self, revision_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM bot_standard_custom_revisions WHERE revision_id=?", (revision_id,)
+        )).fetchone()
+
+    async def list_standard_custom_revisions(self, *, limit: int = 20, offset: int = 0) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        return await (await self.conn.execute(
+            """SELECT revision_id,created_at,created_by,source,summary
+               FROM bot_standard_custom_revisions
+               ORDER BY revision_id DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        )).fetchall()
+
+    async def count_standard_custom_revisions(self) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) AS n FROM bot_standard_custom_revisions"
+        )).fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def get_standard_custom_template_text(
+        self, *, template_key: str, revision_id: int | None = None
+    ) -> str | None:
+        from templates import TEMPLATE_REGISTRY
+
+        spec = TEMPLATE_REGISTRY.get(template_key)
+        if spec is None or spec.scope != "channel":
+            return None
+        if revision_id is None:
+            state = await self.get_standard_custom_state()
+            if state is None:
+                return None
+            revision_id = int(state["active_revision_id"])
+        row = await (await self.conn.execute(
+            """SELECT item_type,payload_json FROM bot_standard_custom_items
+               WHERE revision_id=? AND item_key=?""",
+            (revision_id, f"template:{template_key}"),
+        )).fetchone()
+        if row is None or str(row["item_type"]) != CUSTOM_ITEM_TYPE_TEMPLATE_TEXT:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        text = payload.get("text") if isinstance(payload, dict) else None
+        return text if isinstance(text, str) else None
+
+    async def get_standard_custom_start_card_media(
+        self, *, revision_id: int | None = None
+    ) -> dict[str, str] | None:
+        if revision_id is None:
+            state = await self.get_standard_custom_state()
+            if state is None:
+                return None
+            revision_id = int(state["active_revision_id"])
+        row = await (await self.conn.execute(
+            """SELECT item_type,payload_json FROM bot_standard_custom_items
+               WHERE revision_id=? AND item_key='start_card.media'""",
+            (revision_id,),
+        )).fetchone()
+        if row is None or str(row["item_type"]) != CUSTOM_ITEM_TYPE_START_CARD_MEDIA:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        media_type = payload.get("media_type")
+        media_file_id = payload.get("media_file_id")
+        if media_type not in {"photo", "video", "animation"} or not isinstance(media_file_id, str) or not media_file_id:
+            return None
+        return {"media_type": str(media_type), "media_file_id": media_file_id}
+
+    async def _publish_standard_change_locked(
+        self,
+        *,
+        actor_id: int,
+        changes: dict[str, tuple[str, str] | None],
+        source: str,
+        summary: str,
+        audit_action: str,
+        target_key: str | None,
+        audit_metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        state = await (await self.conn.execute(
+            "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+        )).fetchone()
+        if state is None:
+            raise RuntimeError("Standard Custom Pack is unavailable")
+        previous_revision = int(state["active_revision_id"])
+        current_rows = await (await self.conn.execute(
+            "SELECT item_key,item_type,payload_json FROM bot_standard_custom_items WHERE revision_id=?",
+            (previous_revision,),
+        )).fetchall()
+        current = {
+            str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+            for row in current_rows
+        }
+        effective = dict(current)
+        for item_key, value in changes.items():
+            if value is None:
+                effective.pop(item_key, None)
+            else:
+                effective[item_key] = value
+        if effective == current:
+            return {"revision_id": previous_revision, "previous_revision_id": previous_revision, "changed": False}
+
+        now = dt_to_db(utc_now())
+        cursor = await self.conn.execute(
+            "INSERT INTO bot_standard_custom_revisions(created_at,created_by,source,summary) VALUES(?,?,?,?)",
+            (now, actor_id, source, summary),
+        )
+        revision_id = int(cursor.lastrowid)
+        if effective:
+            await self.conn.executemany(
+                "INSERT INTO bot_standard_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                [(revision_id, key, value[0], value[1]) for key, value in sorted(effective.items())],
+            )
+        await self.conn.execute(
+            "UPDATE bot_standard_custom_state SET active_revision_id=?,updated_at=?,updated_by=? WHERE singleton_id=1",
+            (revision_id, now, actor_id),
+        )
+        metadata = {
+            "previous_revision_id": previous_revision,
+            "revision_id": revision_id,
+            "changed_keys": sorted(changes),
+        }
+        if audit_metadata:
+            metadata.update(audit_metadata)
+        await self.conn.execute(
+            """INSERT INTO customization_audit_log(
+                   actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+               ) VALUES(?,'global_standard',1,NULL,?,?,?,?)""",
+            (actor_id, audit_action, target_key, json.dumps(metadata, ensure_ascii=False, sort_keys=True), now),
+        )
+        return {"revision_id": revision_id, "previous_revision_id": previous_revision, "changed": True}
+
+    async def publish_standard_custom_template_text(
+        self, *, template_key: str, custom_text: str, updated_by: int
+    ) -> dict[str, object]:
+        from templates import TEMPLATE_REGISTRY, validate_template
+
+        spec = TEMPLATE_REGISTRY.get(template_key)
+        if spec is None or spec.scope != "channel":
+            raise ValueError("Only channel-scoped templates belong to the Standard Custom Pack")
+        validate_template(template_key, custom_text)
+        payload = _custom_text_payload(text=custom_text, scope="channel")
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = await self._publish_standard_change_locked(
+                    actor_id=updated_by,
+                    changes={f"template:{template_key}": (CUSTOM_ITEM_TYPE_TEMPLATE_TEXT, payload)},
+                    source="superadmin_edit",
+                    summary=f"Update Standard Custom Pack template {template_key}",
+                    audit_action="global_standard_changed",
+                    target_key=f"template:{template_key}",
+                    audit_metadata={"template_key": template_key},
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def reset_standard_custom_template_text(
+        self, *, template_key: str, updated_by: int
+    ) -> dict[str, object]:
+        from templates import TEMPLATE_REGISTRY
+
+        spec = TEMPLATE_REGISTRY.get(template_key)
+        if spec is None or spec.scope != "channel":
+            raise ValueError("Only channel-scoped templates belong to the Standard Custom Pack")
+        return await self.publish_standard_custom_template_text(
+            template_key=template_key, custom_text=spec.default, updated_by=updated_by
+        )
+
+    async def set_standard_custom_start_card_media(
+        self, *, media_type: str, media_file_id: str, updated_by: int
+    ) -> dict[str, object]:
+        if media_type not in {"photo", "video", "animation"} or not media_file_id:
+            raise ValueError("Unsupported Standard Start Card media")
+        payload = json.dumps(
+            {"media_type": media_type, "media_file_id": media_file_id},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = await self._publish_standard_change_locked(
+                    actor_id=updated_by,
+                    changes={"start_card.media": (CUSTOM_ITEM_TYPE_START_CARD_MEDIA, payload)},
+                    source="superadmin_edit",
+                    summary="Update Standard Channel Start Card media",
+                    audit_action="global_standard_changed",
+                    target_key="start_card.media",
+                    audit_metadata={"media_type": media_type},
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def remove_standard_custom_start_card_media(self, *, updated_by: int) -> dict[str, object]:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                result = await self._publish_standard_change_locked(
+                    actor_id=updated_by,
+                    changes={"start_card.media": None},
+                    source="superadmin_edit",
+                    summary="Remove Standard Channel Start Card media",
+                    audit_action="global_standard_changed",
+                    target_key="start_card.media",
+                    audit_metadata={"operation": "delete"},
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def get_channel_custom_state(self, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_custom_state WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+
+    async def get_channel_custom_items(
+        self,
+        *,
+        channel_id: int,
+        revision_id: int | None = None,
+        include_legacy_template_overlay: bool = True,
+    ) -> dict[str, dict[str, object]]:
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            return {}
+        if revision_id is None:
+            revision_id = int(state["active_revision_id"])
+        revision = await (await self.conn.execute(
+            "SELECT 1 FROM channel_custom_revisions WHERE revision_id=? AND channel_id=?",
+            (revision_id, channel_id),
+        )).fetchone()
+        if revision is None:
+            return {}
+        rows = await (await self.conn.execute(
+            "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=? ORDER BY item_key",
+            (revision_id,),
+        )).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {"raw": str(row["payload_json"])}
+            result[str(row["item_key"])] = {
+                "item_type": str(row["item_type"]),
+                "payload": payload,
+            }
+
+        if include_legacy_template_overlay:
+            override_rows = await (await self.conn.execute(
+                "SELECT template_key,custom_text FROM channel_template_overrides WHERE channel_id=? ORDER BY template_key",
+                (channel_id,),
+            )).fetchall()
+            from templates import TEMPLATE_REGISTRY
+            for row in override_rows:
+                key = str(row["template_key"])
+                spec = TEMPLATE_REGISTRY.get(key)
+                result[f"template:{key}"] = {
+                    "item_type": CUSTOM_ITEM_TYPE_TEMPLATE_TEXT if spec is not None else CUSTOM_ITEM_TYPE_LEGACY_TEMPLATE_OVERRIDE,
+                    "payload": {
+                        "scope": spec.scope if spec is not None else "unknown",
+                        "text": str(row["custom_text"]),
+                    },
+                    "legacy_overlay": True,
+                }
+        return result
+
+    async def get_channel_custom_template_text(
+        self,
+        *,
+        channel_id: int,
+        template_key: str,
+        include_legacy_template_overlay: bool = True,
+        revision_id: int | None = None,
+        include_draft: bool = False,
+    ) -> str | None:
+        if include_draft:
+            draft_text = await self.get_channel_custom_draft_template_text(
+                channel_id=channel_id, template_key=template_key
+            )
+            if draft_text is not None:
+                return draft_text
+        item = (await self.get_channel_custom_items(
+            channel_id=channel_id,
+            revision_id=revision_id,
+            include_legacy_template_overlay=include_legacy_template_overlay and revision_id is None,
+        )).get(f"template:{template_key}")
+        if item is None:
+            return None
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        value = payload.get("text")
+        return value if isinstance(value, str) else None
+
+    async def list_customization_audit(
+        self,
+        *,
+        channel_id: int | None = None,
+        scope_type: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        where: list[str] = []
+        params: list[object] = []
+        if channel_id is not None:
+            where.append("channel_id=?")
+            params.append(channel_id)
+        if scope_type is not None:
+            if scope_type not in {"global_standard", "channel_custom", "global_profile"}:
+                raise ValueError("Unknown customization audit scope")
+            where.append("scope_type=?")
+            params.append(scope_type)
+        query = "SELECT * FROM customization_audit_log"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY event_id DESC LIMIT ? OFFSET ?"
+        params.extend((limit, offset))
+        return await (await self.conn.execute(query, tuple(params))).fetchall()
+
+    async def count_customization_audit(
+        self, *, channel_id: int | None = None, scope_type: str | None = None
+    ) -> int:
+        where: list[str] = []
+        params: list[object] = []
+        if channel_id is not None:
+            where.append("channel_id=?")
+            params.append(channel_id)
+        if scope_type is not None:
+            if scope_type not in {"global_standard", "channel_custom", "global_profile"}:
+                raise ValueError("Unknown customization audit scope")
+            where.append("scope_type=?")
+            params.append(scope_type)
+        query = "SELECT COUNT(*) AS n FROM customization_audit_log"
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        row = await (await self.conn.execute(query, tuple(params))).fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def list_global_customization_audit(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+        return await (await self.conn.execute(
+            """SELECT * FROM customization_audit_log
+               WHERE scope_type IN ('global_standard','global_profile')
+               ORDER BY event_id DESC LIMIT ? OFFSET ?""",
+            (limit, offset),
+        )).fetchall()
+
+    async def count_global_customization_audit(self) -> int:
+        row = await (await self.conn.execute(
+            """SELECT COUNT(*) AS n FROM customization_audit_log
+               WHERE scope_type IN ('global_standard','global_profile')"""
+        )).fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def count_channel_custom_revisions(self, channel_id: int) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) AS n FROM channel_custom_revisions WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def list_channel_custom_revisions(
+        self, *, channel_id: int, limit: int = 10, offset: int = 0
+    ) -> list[sqlite3.Row]:
+        limit = max(1, min(int(limit), 100))
+        offset = max(0, int(offset))
+        return await (await self.conn.execute(
+            """SELECT revision_id,channel_id,source,source_standard_revision_id,
+                      created_at,created_by,summary
+               FROM channel_custom_revisions
+               WHERE channel_id=?
+               ORDER BY revision_id DESC LIMIT ? OFFSET ?""",
+            (channel_id, limit, offset),
+        )).fetchall()
+
+    async def get_channel_custom_revision(
+        self, *, channel_id: int, revision_id: int
+    ) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            """SELECT revision_id,channel_id,source,source_standard_revision_id,
+                      created_at,created_by,summary
+               FROM channel_custom_revisions WHERE channel_id=? AND revision_id=?""",
+            (channel_id, revision_id),
+        )).fetchone()
+
+    async def get_previous_channel_custom_revision_id(
+        self, *, channel_id: int, revision_id: int
+    ) -> int | None:
+        row = await (await self.conn.execute(
+            """SELECT revision_id FROM channel_custom_revisions
+               WHERE channel_id=? AND revision_id<?
+               ORDER BY revision_id DESC LIMIT 1""",
+            (channel_id, revision_id),
+        )).fetchone()
+        return None if row is None else int(row["revision_id"])
+
+    async def diff_channel_custom_revision(
+        self, *, channel_id: int, revision_id: int
+    ) -> dict[str, object]:
+        revision = await self.get_channel_custom_revision(
+            channel_id=channel_id, revision_id=revision_id
+        )
+        if revision is None:
+            raise ValueError("Customization revision is unavailable")
+        previous_id = await self.get_previous_channel_custom_revision_id(
+            channel_id=channel_id, revision_id=revision_id
+        )
+        current = await self.get_channel_custom_items(
+            channel_id=channel_id, revision_id=revision_id,
+            include_legacy_template_overlay=False,
+        )
+        previous = {} if previous_id is None else await self.get_channel_custom_items(
+            channel_id=channel_id, revision_id=previous_id,
+            include_legacy_template_overlay=False,
+        )
+        changed = sorted(
+            key for key in set(current) | set(previous)
+            if current.get(key) != previous.get(key)
+        )
+        return {
+            "revision_id": revision_id,
+            "previous_revision_id": previous_id,
+            "changed_keys": changed,
+            "item_count": len(current),
+        }
+
+    # ------------------------------------------------------------------
+    # Persistent channel customization drafts (schema v26).
+    # ------------------------------------------------------------------
+    async def get_channel_custom_draft_state(self, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_custom_drafts WHERE channel_id=?", (channel_id,)
+        )).fetchone()
+
+    async def get_channel_custom_draft_items(self, channel_id: int) -> dict[str, dict[str, object]]:
+        rows = await (await self.conn.execute(
+            """SELECT item_key,operation,item_type,payload_json,updated_at,updated_by
+               FROM channel_custom_draft_items WHERE channel_id=? ORDER BY item_key""",
+            (channel_id,),
+        )).fetchall()
+        result: dict[str, dict[str, object]] = {}
+        for row in rows:
+            payload: object = None
+            raw = row["payload_json"]
+            if raw is not None:
+                try:
+                    payload = json.loads(str(raw))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    payload = {"raw": str(raw)}
+            result[str(row["item_key"])] = {
+                "operation": str(row["operation"]),
+                "item_type": None if row["item_type"] is None else str(row["item_type"]),
+                "payload": payload,
+                "updated_at": str(row["updated_at"]),
+                "updated_by": int(row["updated_by"]),
+            }
+        return result
+
+    async def get_channel_custom_draft_count(self, channel_id: int) -> int:
+        row = await (await self.conn.execute(
+            "SELECT COUNT(*) AS n FROM channel_custom_draft_items WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+        return 0 if row is None else int(row["n"])
+
+    async def has_channel_custom_draft(self, channel_id: int) -> bool:
+        return await self.get_channel_custom_draft_count(channel_id) > 0
+
+    async def _ensure_custom_draft_locked(self, *, channel_id: int, updated_by: int) -> int:
+        state = await (await self.conn.execute(
+            "SELECT active_revision_id FROM channel_custom_state WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        active_revision_id = int(state["active_revision_id"])
+        draft = await (await self.conn.execute(
+            "SELECT base_revision_id FROM channel_custom_drafts WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+        if draft is not None:
+            if int(draft["base_revision_id"]) != active_revision_id:
+                raise DraftConflictError("Draft base revision is stale")
+            await self.conn.execute(
+                "UPDATE channel_custom_drafts SET updated_at=?,updated_by=? WHERE channel_id=?",
+                (dt_to_db(utc_now()), updated_by, channel_id),
+            )
+            return active_revision_id
+        now = dt_to_db(utc_now())
+        await self.conn.execute(
+            """INSERT INTO channel_custom_drafts(
+                   channel_id,base_revision_id,created_at,updated_at,updated_by
+               ) VALUES(?,?,?,?,?)""",
+            (channel_id, active_revision_id, now, now, updated_by),
+        )
+        return active_revision_id
+
+    async def _set_custom_draft_item_locked(
+        self,
+        *,
+        channel_id: int,
+        item_key: str,
+        operation: str,
+        item_type: str | None,
+        payload_json: str | None,
+        updated_by: int,
+    ) -> None:
+        if operation not in {"set", "delete"}:
+            raise ValueError("Unsupported draft operation")
+        await self._ensure_custom_draft_locked(channel_id=channel_id, updated_by=updated_by)
+        now = dt_to_db(utc_now())
+        await self.conn.execute(
+            """INSERT INTO channel_custom_draft_items(
+                   channel_id,item_key,operation,item_type,payload_json,updated_at,updated_by
+               ) VALUES(?,?,?,?,?,?,?)
+               ON CONFLICT(channel_id,item_key) DO UPDATE SET
+                   operation=excluded.operation,
+                   item_type=excluded.item_type,
+                   payload_json=excluded.payload_json,
+                   updated_at=excluded.updated_at,
+                   updated_by=excluded.updated_by""",
+            (channel_id, item_key, operation, item_type, payload_json, now, updated_by),
+        )
+
+    async def set_channel_custom_draft_template_text(
+        self, *, channel_id: int, template_key: str, custom_text: str, updated_by: int
+    ) -> None:
+        from templates import TEMPLATE_REGISTRY, validate_template
+        spec = TEMPLATE_REGISTRY.get(template_key)
+        if spec is None or spec.scope != "channel":
+            raise ValueError("Template is not channel-scoped")
+        validate_template(template_key, custom_text)
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._set_custom_draft_item_locked(
+                    channel_id=channel_id,
+                    item_key=f"template:{template_key}",
+                    operation="set",
+                    item_type=CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                    payload_json=_custom_text_payload(text=custom_text, scope=spec.scope),
+                    updated_by=updated_by,
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def get_channel_custom_draft_template_text(
+        self, *, channel_id: int, template_key: str
+    ) -> str | None:
+        row = await (await self.conn.execute(
+            """SELECT operation,payload_json FROM channel_custom_draft_items
+               WHERE channel_id=? AND item_key=?""",
+            (channel_id, f"template:{template_key}"),
+        )).fetchone()
+        if row is None or str(row["operation"]) != "set" or row["payload_json"] is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        value = payload.get("text") if isinstance(payload, dict) else None
+        return value if isinstance(value, str) else None
+
+    async def list_channel_custom_draft_template_keys(self, channel_id: int) -> set[str]:
+        rows = await (await self.conn.execute(
+            """SELECT item_key FROM channel_custom_draft_items
+               WHERE channel_id=? AND item_key LIKE 'template:%' ORDER BY item_key""",
+            (channel_id,),
+        )).fetchall()
+        return {str(row["item_key"])[len("template:"):] for row in rows}
+
+    async def stage_channel_custom_template_reset(
+        self, *, channel_id: int, template_key: str, updated_by: int
+    ) -> None:
+        from templates import TEMPLATE_REGISTRY
+        spec = TEMPLATE_REGISTRY.get(template_key)
+        if spec is None or spec.scope != "channel":
+            raise ValueError("Template is not channel-scoped")
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        text = await self.get_channel_custom_template_text(
+            channel_id=channel_id,
+            template_key=template_key,
+            include_legacy_template_overlay=False,
+            revision_id=int(state["initial_revision_id"]),
+        )
+        if text is None:
+            text = spec.default
+        await self.set_channel_custom_draft_template_text(
+            channel_id=channel_id, template_key=template_key,
+            custom_text=text, updated_by=updated_by,
+        )
+
+    async def stage_all_channel_custom_template_resets(
+        self, *, channel_id: int, updated_by: int
+    ) -> int:
+        from templates import TEMPLATE_REGISTRY
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        initial_items = await self.get_channel_custom_items(
+            channel_id=channel_id,
+            revision_id=int(state["initial_revision_id"]),
+            include_legacy_template_overlay=False,
+        )
+        staged = 0
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._ensure_custom_draft_locked(channel_id=channel_id, updated_by=updated_by)
+                for key, spec in sorted(TEMPLATE_REGISTRY.items()):
+                    if spec.scope != "channel":
+                        continue
+                    item = initial_items.get(f"template:{key}")
+                    text = None
+                    if item is not None and isinstance(item.get("payload"), dict):
+                        value = item["payload"].get("text")
+                        if isinstance(value, str):
+                            text = value
+                    if text is None:
+                        text = spec.default
+                    await self._set_custom_draft_item_locked(
+                        channel_id=channel_id,
+                        item_key=f"template:{key}",
+                        operation="set",
+                        item_type=CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                        payload_json=_custom_text_payload(text=text, scope=spec.scope),
+                        updated_by=updated_by,
+                    )
+                    staged += 1
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+        return staged
+
+    async def set_channel_custom_draft_start_card_media(
+        self, *, channel_id: int, media_type: str, media_file_id: str, updated_by: int
+    ) -> None:
+        if media_type not in {"photo", "video", "animation"} or not media_file_id:
+            raise ValueError("Unsupported start-card media")
+        payload = json.dumps(
+            {"media_type": media_type, "media_file_id": media_file_id},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._set_custom_draft_item_locked(
+                    channel_id=channel_id, item_key="start_card.media", operation="set",
+                    item_type=CUSTOM_ITEM_TYPE_START_CARD_MEDIA, payload_json=payload,
+                    updated_by=updated_by,
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def stage_channel_custom_start_card_media_removal(
+        self, *, channel_id: int, updated_by: int
+    ) -> None:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                await self._set_custom_draft_item_locked(
+                    channel_id=channel_id, item_key="start_card.media", operation="delete",
+                    item_type=None, payload_json=None, updated_by=updated_by,
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def get_channel_custom_draft_start_card_media(self, channel_id: int) -> dict[str, object] | None:
+        row = await (await self.conn.execute(
+            """SELECT operation,payload_json FROM channel_custom_draft_items
+               WHERE channel_id=? AND item_key='start_card.media'""",
+            (channel_id,),
+        )).fetchone()
+        if row is None:
+            return None
+        operation = str(row["operation"])
+        if operation == "delete":
+            return {"operation": "delete"}
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"operation": "invalid"}
+        if not isinstance(payload, dict):
+            return {"operation": "invalid"}
+        return {
+            "operation": "set",
+            "media_type": payload.get("media_type"),
+            "media_file_id": payload.get("media_file_id"),
+        }
+
+    async def get_channel_custom_start_card_media(
+        self, channel_id: int, *, revision_id: int | None = None
+    ) -> dict[str, str] | None:
+        items = await self.get_channel_custom_items(
+            channel_id=channel_id, revision_id=revision_id,
+            include_legacy_template_overlay=False
+        )
+        item = items.get("start_card.media")
+        if item is None or not isinstance(item.get("payload"), dict):
+            return None
+        payload = item["payload"]
+        media_type = payload.get("media_type")
+        media_file_id = payload.get("media_file_id")
+        if media_type not in {"photo", "video", "animation"} or not isinstance(media_file_id, str) or not media_file_id:
+            return None
+        return {"media_type": str(media_type), "media_file_id": media_file_id}
+
+    @staticmethod
+    def _plan_supported_channel_custom_changes(
+        *,
+        current: dict[str, tuple[str, str]],
+        target: dict[str, tuple[str, str]],
+        fallback: dict[str, tuple[str, str]] | None = None,
+    ) -> dict[str, object]:
+        """Build safe draft instructions for the owner-customizable surface only.
+
+        Channel-scoped template text and the post-Start media card are the only
+        bulk-copyable item types. Global templates are intentionally ignored;
+        unknown/legacy changed items are reported as skipped instead of being
+        rewritten blindly.
+        """
+        from templates import TEMPLATE_REGISTRY, validate_template
+
+        fallback = fallback or {}
+        instructions: list[tuple[str, str, str | None, str | None]] = []
+        skipped_keys: list[str] = []
+        for item_key in sorted(set(current) | set(target)):
+            current_item = current.get(item_key)
+            target_item = target.get(item_key)
+            if current_item == target_item:
+                continue
+
+            if item_key == "start_card.media":
+                if target_item is None:
+                    if current_item is not None:
+                        instructions.append((item_key, "delete", None, None))
+                    continue
+                item_type, raw_payload = target_item
+                try:
+                    payload = json.loads(raw_payload)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    skipped_keys.append(item_key)
+                    continue
+                media_type = payload.get("media_type") if isinstance(payload, dict) else None
+                media_file_id = payload.get("media_file_id") if isinstance(payload, dict) else None
+                if (
+                    item_type == CUSTOM_ITEM_TYPE_START_CARD_MEDIA
+                    and media_type in {"photo", "video", "animation"}
+                    and isinstance(media_file_id, str) and media_file_id
+                ):
+                    instructions.append((item_key, "set", item_type, raw_payload))
+                else:
+                    skipped_keys.append(item_key)
+                continue
+
+            if not item_key.startswith("template:"):
+                skipped_keys.append(item_key)
+                continue
+            template_key = item_key[len("template:"):]
+            spec = TEMPLATE_REGISTRY.get(template_key)
+            # Global bot/profile texts never belong to a Channel Custom Pack
+            # operation even if old immutable snapshots contain them.
+            if spec is not None and spec.scope != "channel":
+                continue
+            if spec is None:
+                skipped_keys.append(item_key)
+                continue
+
+            candidate = target_item
+            if candidate is None:
+                fallback_item = fallback.get(item_key)
+                candidate = fallback_item if fallback_item is not None else (
+                    CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                    _custom_text_payload(text=spec.default, scope=spec.scope),
+                )
+            item_type, raw_payload = candidate
+            try:
+                payload = json.loads(raw_payload)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                skipped_keys.append(item_key)
+                continue
+            text = payload.get("text") if isinstance(payload, dict) else None
+            if item_type != CUSTOM_ITEM_TYPE_TEMPLATE_TEXT or not isinstance(text, str):
+                skipped_keys.append(item_key)
+                continue
+            try:
+                validate_template(template_key, text)
+            except ValueError:
+                skipped_keys.append(item_key)
+                continue
+            normalized_payload = _custom_text_payload(text=text, scope=spec.scope)
+            normalized_target = (CUSTOM_ITEM_TYPE_TEMPLATE_TEXT, normalized_payload)
+            if current_item != normalized_target:
+                instructions.append((item_key, "set", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT, normalized_payload))
+
+        return {
+            "instructions": instructions,
+            "changed_keys": [item[0] for item in instructions],
+            "skipped_keys": skipped_keys,
+            "staged": len(instructions),
+            "skipped": len(skipped_keys),
+        }
+
+    async def _raw_channel_revision_items(self, *, channel_id: int, revision_id: int) -> dict[str, tuple[str, str]]:
+        revision = await (await self.conn.execute(
+            "SELECT 1 FROM channel_custom_revisions WHERE channel_id=? AND revision_id=?",
+            (channel_id, revision_id),
+        )).fetchone()
+        if revision is None:
+            raise ValueError("Customization revision is unavailable")
+        rows = await (await self.conn.execute(
+            "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=?",
+            (revision_id,),
+        )).fetchall()
+        return {
+            str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+            for row in rows
+        }
+
+    async def _raw_standard_revision_items(self, revision_id: int | None) -> dict[str, tuple[str, str]]:
+        if revision_id is None:
+            return {}
+        revision = await (await self.conn.execute(
+            "SELECT 1 FROM bot_standard_custom_revisions WHERE revision_id=?", (int(revision_id),)
+        )).fetchone()
+        if revision is None:
+            raise ValueError("Standard Custom Pack revision is unavailable")
+        rows = await (await self.conn.execute(
+            "SELECT item_key,item_type,payload_json FROM bot_standard_custom_items WHERE revision_id=?",
+            (int(revision_id),),
+        )).fetchall()
+        return {
+            str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+            for row in rows
+        }
+
+    async def _plan_channel_custom_target(
+        self,
+        *,
+        channel_id: int,
+        target: dict[str, tuple[str, str]],
+        fallback: dict[str, tuple[str, str]] | None = None,
+    ) -> dict[str, object]:
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        current = await self._raw_channel_revision_items(
+            channel_id=channel_id, revision_id=int(state["active_revision_id"])
+        )
+        plan = self._plan_supported_channel_custom_changes(
+            current=current, target=target, fallback=fallback,
+        )
+        plan["base_revision_id"] = int(state["active_revision_id"])
+        return plan
+
+    async def plan_channel_custom_initial_reset(self, *, channel_id: int) -> dict[str, object]:
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        initial_revision_id = int(state["initial_revision_id"])
+        revision = await self.get_channel_custom_revision(
+            channel_id=channel_id, revision_id=initial_revision_id
+        )
+        if revision is None:
+            raise ValueError("Initial customization revision is unavailable")
+        target = await self._raw_channel_revision_items(
+            channel_id=channel_id, revision_id=initial_revision_id
+        )
+        source_standard_revision_id = revision["source_standard_revision_id"]
+        fallback = await self._raw_standard_revision_items(
+            None if source_standard_revision_id is None else int(source_standard_revision_id)
+        )
+        result = await self._plan_channel_custom_target(
+            channel_id=channel_id, target=target, fallback=fallback,
+        )
+        result.update({
+            "target_revision_id": initial_revision_id,
+            "source_standard_revision_id": None if source_standard_revision_id is None else int(source_standard_revision_id),
+        })
+        return result
+
+    async def plan_channel_custom_apply_current_standard(self, *, channel_id: int) -> dict[str, object]:
+        standard_state = await self.get_standard_custom_state()
+        if standard_state is None:
+            raise ValueError("Standard Custom Pack state is unavailable")
+        standard_revision_id = int(standard_state["active_revision_id"])
+        target = await self._raw_standard_revision_items(standard_revision_id)
+        result = await self._plan_channel_custom_target(
+            channel_id=channel_id, target=target, fallback=target,
+        )
+        result["source_standard_revision_id"] = standard_revision_id
+        return result
+
+    async def _validate_copy_source(self, *, channel_id: int, source_channel_id: int, actor_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+        if channel_id == source_channel_id:
+            raise ValueError("Source and target channels must differ")
+        target = await (await self.conn.execute(
+            "SELECT * FROM channels WHERE channel_id=? AND enabled=1", (channel_id,)
+        )).fetchone()
+        source = await (await self.conn.execute(
+            "SELECT * FROM channels WHERE channel_id=? AND enabled=1", (source_channel_id,)
+        )).fetchone()
+        if target is None or source is None:
+            raise PermissionError("Customization copy source is unavailable")
+        if int(target["owner_id"]) != actor_id or int(source["owner_id"]) != actor_id:
+            raise PermissionError("Customization copy requires the same channel owner")
+        return target, source
+
+    async def plan_channel_custom_copy(
+        self, *, channel_id: int, source_channel_id: int, actor_id: int
+    ) -> dict[str, object]:
+        _, source = await self._validate_copy_source(
+            channel_id=channel_id, source_channel_id=source_channel_id, actor_id=actor_id
+        )
+        source_state = await self.get_channel_custom_state(source_channel_id)
+        if source_state is None:
+            raise ValueError("Source customization state is unavailable")
+        source_revision_id = int(source_state["active_revision_id"])
+        source_revision = await self.get_channel_custom_revision(
+            channel_id=source_channel_id, revision_id=source_revision_id
+        )
+        if source_revision is None:
+            raise ValueError("Source customization revision is unavailable")
+        target = await self._raw_channel_revision_items(
+            channel_id=source_channel_id, revision_id=source_revision_id
+        )
+        source_standard_revision_id = source_revision["source_standard_revision_id"]
+        fallback = await self._raw_standard_revision_items(
+            None if source_standard_revision_id is None else int(source_standard_revision_id)
+        )
+        result = await self._plan_channel_custom_target(
+            channel_id=channel_id, target=target, fallback=fallback,
+        )
+        result.update({
+            "source_channel_id": int(source["channel_id"]),
+            "source_channel_name": str(source["group_title"]),
+            "source_revision_id": source_revision_id,
+            "source_standard_revision_id": None if source_standard_revision_id is None else int(source_standard_revision_id),
+        })
+        return result
+
+    async def _stage_bulk_custom_plan_locked(
+        self,
+        *,
+        channel_id: int,
+        actor_id: int,
+        plan: dict[str, object],
+        publish_source: str,
+        publish_summary: str,
+        audit_action: str,
+        source_channel_id: int | None = None,
+        source_standard_revision_id: int | None = None,
+        audit_metadata: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        existing = await (await self.conn.execute(
+            "SELECT 1 FROM channel_custom_drafts WHERE channel_id=?", (channel_id,)
+        )).fetchone()
+        if existing is not None:
+            raise DraftNotEmptyError("Publish or discard the current draft first")
+        instructions = list(plan.get("instructions") or [])
+        if not instructions:
+            raise ValueError("Customization source has no applicable differences")
+        await self._ensure_custom_draft_locked(channel_id=channel_id, updated_by=actor_id)
+        for item_key, operation, item_type, payload_json in instructions:
+            await self._set_custom_draft_item_locked(
+                channel_id=channel_id,
+                item_key=str(item_key),
+                operation=str(operation),
+                item_type=None if item_type is None else str(item_type),
+                payload_json=None if payload_json is None else str(payload_json),
+                updated_by=actor_id,
+            )
+        now = dt_to_db(utc_now())
+        await self.conn.execute(
+            """UPDATE channel_custom_drafts
+               SET publish_source=?,publish_summary=?,restore_revision_id=NULL,
+                   source_channel_id=?,source_standard_revision_id=?,updated_at=?,updated_by=?
+               WHERE channel_id=?""",
+            (
+                publish_source, publish_summary, source_channel_id, source_standard_revision_id,
+                now, actor_id, channel_id,
+            ),
+        )
+        metadata = {
+            "base_revision_id": int(plan.get("base_revision_id") or 0),
+            "staged_keys": list(plan.get("changed_keys") or []),
+            "skipped_keys": list(plan.get("skipped_keys") or []),
+            "source_channel_id": source_channel_id,
+            "source_standard_revision_id": source_standard_revision_id,
+        }
+        if audit_metadata:
+            metadata.update(audit_metadata)
+        await self.conn.execute(
+            """INSERT INTO customization_audit_log(
+                   actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+               ) VALUES(?,'channel_custom',?,?,?,NULL,?,?)""",
+            (
+                actor_id, channel_id, channel_id, audit_action,
+                json.dumps(metadata, ensure_ascii=False, sort_keys=True), now,
+            ),
+        )
+        return {
+            **plan,
+            "publish_source": publish_source,
+            "source_channel_id": source_channel_id,
+            "source_standard_revision_id": source_standard_revision_id,
+        }
+
+    async def stage_channel_custom_initial_reset(
+        self, *, channel_id: int, reset_by: int
+    ) -> dict[str, object]:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                plan = await self.plan_channel_custom_initial_reset(channel_id=channel_id)
+                result = await self._stage_bulk_custom_plan_locked(
+                    channel_id=channel_id,
+                    actor_id=reset_by,
+                    plan=plan,
+                    publish_source="reset_initial",
+                    publish_summary="Restore the initial channel customization snapshot",
+                    audit_action="initial_reset_staged",
+                    source_standard_revision_id=plan.get("source_standard_revision_id"),
+                    audit_metadata={"target_revision_id": plan.get("target_revision_id")},
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def stage_channel_custom_current_standard(
+        self, *, channel_id: int, applied_by: int
+    ) -> dict[str, object]:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                plan = await self.plan_channel_custom_apply_current_standard(channel_id=channel_id)
+                standard_revision_id = int(plan["source_standard_revision_id"])
+                result = await self._stage_bulk_custom_plan_locked(
+                    channel_id=channel_id,
+                    actor_id=applied_by,
+                    plan=plan,
+                    publish_source="apply_current_standard",
+                    publish_summary=f"Apply Standard Custom Pack revision #{standard_revision_id}",
+                    audit_action="current_standard_staged",
+                    source_standard_revision_id=standard_revision_id,
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def stage_channel_custom_copy(
+        self, *, channel_id: int, source_channel_id: int, copied_by: int
+    ) -> dict[str, object]:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                plan = await self.plan_channel_custom_copy(
+                    channel_id=channel_id, source_channel_id=source_channel_id, actor_id=copied_by
+                )
+                source_revision_id = int(plan["source_revision_id"])
+                source_standard_revision_id = plan.get("source_standard_revision_id")
+                result = await self._stage_bulk_custom_plan_locked(
+                    channel_id=channel_id,
+                    actor_id=copied_by,
+                    plan=plan,
+                    publish_source="copy_from_channel",
+                    publish_summary=f"Copy published customization from channel #{source_channel_id} revision #{source_revision_id}",
+                    audit_action="channel_copy_staged",
+                    source_channel_id=source_channel_id,
+                    source_standard_revision_id=source_standard_revision_id,
+                    audit_metadata={"source_revision_id": source_revision_id},
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def export_channel_custom_pack(
+        self, *, channel_id: int, exported_by: int
+    ) -> dict[str, object]:
+        """Build and audit a safe export of one owner's published customization.
+
+        Only presentation data from the active immutable channel revision is
+        exported.  Subscriber/moderation/security tables are never queried.
+        """
+        from custom_transfer import build_export_document, dumps_export_document
+        from templates import TEMPLATE_REGISTRY
+
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                channel = await (await self.conn.execute(
+                    "SELECT channel_id,owner_id,group_title,enabled FROM channels WHERE channel_id=?",
+                    (channel_id,),
+                )).fetchone()
+                if channel is None or not bool(channel["enabled"]) or int(channel["owner_id"]) != exported_by:
+                    raise PermissionError("Customization export requires the channel owner")
+                state = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_state WHERE channel_id=?", (channel_id,)
+                )).fetchone()
+                if state is None:
+                    raise ValueError("Channel customization state is unavailable")
+                revision_id = int(state["active_revision_id"])
+                revision = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_revisions WHERE channel_id=? AND revision_id=?",
+                    (channel_id, revision_id),
+                )).fetchone()
+                if revision is None:
+                    raise ValueError("Active customization revision is unavailable")
+                rows = await (await self.conn.execute(
+                    "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=? ORDER BY item_key",
+                    (revision_id,),
+                )).fetchall()
+                raw_items = {
+                    str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+                    for row in rows
+                }
+
+                template_texts: dict[str, str] = {}
+                supported_item_keys = {"start_card.media"}
+                for key, spec in sorted(TEMPLATE_REGISTRY.items()):
+                    if spec.scope != "channel":
+                        continue
+                    item_key = f"template:{key}"
+                    supported_item_keys.add(item_key)
+                    raw_item = raw_items.get(item_key)
+                    text = None
+                    if raw_item is not None and raw_item[0] == CUSTOM_ITEM_TYPE_TEMPLATE_TEXT:
+                        try:
+                            payload = json.loads(raw_item[1])
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            payload = None
+                        candidate = payload.get("text") if isinstance(payload, dict) else None
+                        if isinstance(candidate, str):
+                            text = candidate
+                    template_texts[key] = spec.default if text is None else text
+
+                media = None
+                raw_media = raw_items.get("start_card.media")
+                if raw_media is not None and raw_media[0] == CUSTOM_ITEM_TYPE_START_CARD_MEDIA:
+                    try:
+                        parsed_media = json.loads(raw_media[1])
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        parsed_media = None
+                    if isinstance(parsed_media, dict):
+                        media_type = parsed_media.get("media_type")
+                        media_file_id = parsed_media.get("media_file_id")
+                        if (
+                            media_type in {"photo", "video", "animation"}
+                            and isinstance(media_file_id, str) and media_file_id
+                        ):
+                            media = {
+                                "media_type": str(media_type),
+                                "media_file_id": media_file_id,
+                            }
+
+                omitted = sum(1 for key in raw_items if key not in supported_item_keys)
+                source_standard = revision["source_standard_revision_id"]
+                document = build_export_document(
+                    channel_id=channel_id,
+                    channel_title=str(channel["group_title"]),
+                    revision_id=revision_id,
+                    source_standard_revision_id=(
+                        None if source_standard is None else int(source_standard)
+                    ),
+                    template_texts=template_texts,
+                    media=media,
+                    omitted_unsupported_items=omitted,
+                )
+                digest = hashlib.sha256(dumps_export_document(document)).hexdigest()
+                now = dt_to_db(utc_now())
+                await self.conn.execute(
+                    """INSERT INTO customization_audit_log(
+                           actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                       ) VALUES(?,'channel_custom',?,?, 'custom_exported',NULL,?,?)""",
+                    (
+                        exported_by, channel_id, channel_id,
+                        json.dumps({
+                            "revision_id": revision_id,
+                            "schema_version": int(document["schema_version"]),
+                            "document_sha256": digest,
+                            "omitted_unsupported_items": omitted,
+                        }, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+                await self.conn.commit()
+                return document
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def plan_channel_custom_import(
+        self, *, channel_id: int, actor_id: int, pack
+    ) -> dict[str, object]:
+        """Permission-check and diff a normalized transfer pack against live state."""
+        from custom_transfer import NormalizedCustomPack
+        from templates import TEMPLATE_REGISTRY
+
+        if not isinstance(pack, NormalizedCustomPack):
+            raise TypeError("NormalizedCustomPack is required")
+        channel = await (await self.conn.execute(
+            "SELECT channel_id,owner_id,enabled FROM channels WHERE channel_id=?", (channel_id,)
+        )).fetchone()
+        if channel is None or not bool(channel["enabled"]) or int(channel["owner_id"]) != actor_id:
+            raise PermissionError("Customization import requires the channel owner")
+        state = await self.get_channel_custom_state(channel_id)
+        if state is None:
+            raise ValueError("Channel customization state is unavailable")
+        current = await self._raw_channel_revision_items(
+            channel_id=channel_id, revision_id=int(state["active_revision_id"])
+        )
+        target = dict(current)
+        for template_key, text in sorted(pack.templates.items()):
+            spec = TEMPLATE_REGISTRY.get(template_key)
+            if spec is None or spec.scope != "channel":
+                raise ValueError("Imported template is not channel-scoped")
+            target[f"template:{template_key}"] = (
+                CUSTOM_ITEM_TYPE_TEMPLATE_TEXT,
+                _custom_text_payload(text=text, scope=spec.scope),
+            )
+        if pack.media_type is None or pack.media_file_id is None:
+            target.pop("start_card.media", None)
+        else:
+            target["start_card.media"] = (
+                CUSTOM_ITEM_TYPE_START_CARD_MEDIA,
+                json.dumps(
+                    {"media_type": pack.media_type, "media_file_id": pack.media_file_id},
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ),
+            )
+        plan = self._plan_supported_channel_custom_changes(current=current, target=target)
+        plan.update({
+            "base_revision_id": int(state["active_revision_id"]),
+            "import_schema_version": 1,
+            "import_source_channel_id": pack.source_channel_id,
+            "import_source_channel_title": pack.source_channel_title,
+            "import_source_revision_id": pack.source_revision_id,
+            "import_source_standard_revision_id": pack.source_standard_revision_id,
+            "import_document_sha256": pack.document_sha256,
+            "import_has_media": pack.media_file_id is not None,
+        })
+        return plan
+
+    async def stage_channel_custom_import(
+        self, *, channel_id: int, imported_by: int, pack
+    ) -> dict[str, object]:
+        """Stage a validated transfer pack into a fresh draft, never directly live."""
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                # Re-run permissions and diff at the moment of staging. This
+                # prevents stale FSM/callback data from bypassing ownership.
+                plan = await self.plan_channel_custom_import(
+                    channel_id=channel_id, actor_id=imported_by, pack=pack
+                )
+                source_title = str(plan.get("import_source_channel_title") or "")
+                source_revision_id = plan.get("import_source_revision_id")
+                summary = "Import Channel Custom Pack schema v1"
+                if source_title:
+                    summary += f" from {source_title}"
+                if source_revision_id is not None:
+                    summary += f" revision #{int(source_revision_id)}"
+                result = await self._stage_bulk_custom_plan_locked(
+                    channel_id=channel_id,
+                    actor_id=imported_by,
+                    plan=plan,
+                    publish_source="import",
+                    publish_summary=summary,
+                    audit_action="custom_imported",
+                    audit_metadata={
+                        "status": "staged",
+                        "schema_version": 1,
+                        "source_channel_id": plan.get("import_source_channel_id"),
+                        "source_channel_title": source_title,
+                        "source_revision_id": source_revision_id,
+                        "source_standard_revision_id": plan.get("import_source_standard_revision_id"),
+                        "document_sha256": plan.get("import_document_sha256"),
+                        "has_media": bool(plan.get("import_has_media")),
+                    },
+                )
+                await self.conn.commit()
+                return result
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def stage_channel_custom_revision_restore(
+        self, *, channel_id: int, revision_id: int, restored_by: int
+    ) -> dict[str, object]:
+        """Restore a historical revision into a fresh draft, never directly to live.
+
+        Only supported channel customization item types are staged. Historical
+        unknown/legacy items are left untouched rather than risking data loss.
+        Publication later creates a new immutable revision with source
+        ``rollback``.
+        """
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                state = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_state WHERE channel_id=?", (channel_id,)
+                )).fetchone()
+                target_revision = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_revisions WHERE channel_id=? AND revision_id=?",
+                    (channel_id, revision_id),
+                )).fetchone()
+                if state is None or target_revision is None:
+                    raise ValueError("Customization revision is unavailable")
+                active_revision_id = int(state["active_revision_id"])
+                if active_revision_id == revision_id:
+                    raise ValueError("Customization revision is already active")
+
+                existing_draft = await (await self.conn.execute(
+                    "SELECT 1 FROM channel_custom_draft_items WHERE channel_id=? LIMIT 1",
+                    (channel_id,),
+                )).fetchone()
+                if existing_draft is not None:
+                    raise DraftNotEmptyError("Publish or discard the current draft first")
+
+                current_rows = await (await self.conn.execute(
+                    "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=?",
+                    (active_revision_id,),
+                )).fetchall()
+                target_rows = await (await self.conn.execute(
+                    "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=?",
+                    (revision_id,),
+                )).fetchall()
+                current = {
+                    str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+                    for row in current_rows
+                }
+                target = {
+                    str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+                    for row in target_rows
+                }
+                target_standard: dict[str, tuple[str, str]] = {}
+                source_standard_revision_id = target_revision["source_standard_revision_id"]
+                if source_standard_revision_id is not None:
+                    standard_rows = await (await self.conn.execute(
+                        "SELECT item_key,item_type,payload_json FROM bot_standard_custom_items WHERE revision_id=?",
+                        (int(source_standard_revision_id),),
+                    )).fetchall()
+                    target_standard = {
+                        str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+                        for row in standard_rows
+                    }
+
+                from templates import TEMPLATE_REGISTRY, validate_template
+                instructions: list[tuple[str, str, str | None, str | None]] = []
+                skipped_keys: list[str] = []
+                for item_key in sorted(set(current) | set(target)):
+                    if current.get(item_key) == target.get(item_key):
+                        continue
+                    target_item = target.get(item_key)
+                    if target_item is None:
+                        current_item = current.get(item_key)
+                        if item_key == "start_card.media" and current_item is not None:
+                            instructions.append((item_key, "delete", None, None))
+                            continue
+                        if current_item is not None and current_item[0] == CUSTOM_ITEM_TYPE_TEMPLATE_TEXT and item_key.startswith("template:"):
+                            template_key = item_key[len("template:"):]
+                            spec = TEMPLATE_REGISTRY.get(template_key)
+                            if spec is not None and spec.scope == "channel":
+                                standard_item = target_standard.get(item_key)
+                                payload = None
+                                if standard_item is not None and standard_item[0] == CUSTOM_ITEM_TYPE_TEMPLATE_TEXT:
+                                    try:
+                                        parsed_standard = json.loads(standard_item[1])
+                                    except (TypeError, ValueError, json.JSONDecodeError):
+                                        parsed_standard = None
+                                    standard_text = parsed_standard.get("text") if isinstance(parsed_standard, dict) else None
+                                    if isinstance(standard_text, str):
+                                        try:
+                                            validate_template(template_key, standard_text)
+                                        except ValueError:
+                                            standard_text = None
+                                    if isinstance(standard_text, str):
+                                        payload = _custom_text_payload(text=standard_text, scope=spec.scope)
+                                if payload is None:
+                                    payload = _custom_text_payload(text=spec.default, scope=spec.scope)
+                                if current_item != (CUSTOM_ITEM_TYPE_TEMPLATE_TEXT, payload):
+                                    instructions.append((item_key, "set", CUSTOM_ITEM_TYPE_TEMPLATE_TEXT, payload))
+                                continue
+                        skipped_keys.append(item_key)
+                        continue
+
+                    item_type, raw_payload = target_item
+                    try:
+                        payload = json.loads(raw_payload)
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        skipped_keys.append(item_key)
+                        continue
+                    if item_type == CUSTOM_ITEM_TYPE_TEMPLATE_TEXT and item_key.startswith("template:"):
+                        template_key = item_key[len("template:"):]
+                        spec = TEMPLATE_REGISTRY.get(template_key)
+                        text = payload.get("text") if isinstance(payload, dict) else None
+                        if spec is None or spec.scope != "channel" or not isinstance(text, str):
+                            skipped_keys.append(item_key)
+                            continue
+                        try:
+                            validate_template(template_key, text)
+                        except ValueError:
+                            skipped_keys.append(item_key)
+                            continue
+                        instructions.append((item_key, "set", item_type, raw_payload))
+                        continue
+                    if item_type == CUSTOM_ITEM_TYPE_START_CARD_MEDIA and item_key == "start_card.media":
+                        media_type = payload.get("media_type") if isinstance(payload, dict) else None
+                        media_file_id = payload.get("media_file_id") if isinstance(payload, dict) else None
+                        if media_type in {"photo", "video", "animation"} and isinstance(media_file_id, str) and media_file_id:
+                            instructions.append((item_key, "set", item_type, raw_payload))
+                        else:
+                            skipped_keys.append(item_key)
+                        continue
+                    skipped_keys.append(item_key)
+
+                if not instructions:
+                    raise ValueError("Revision has no restorable differences")
+
+                await self._ensure_custom_draft_locked(channel_id=channel_id, updated_by=restored_by)
+                for item_key, operation, item_type, payload_json in instructions:
+                    await self._set_custom_draft_item_locked(
+                        channel_id=channel_id, item_key=item_key, operation=operation,
+                        item_type=item_type, payload_json=payload_json, updated_by=restored_by,
+                    )
+                await self.conn.execute(
+                    """UPDATE channel_custom_drafts
+                       SET publish_source='rollback',publish_summary=?,restore_revision_id=?,
+                           source_channel_id=NULL,source_standard_revision_id=?,updated_at=?,updated_by=?
+                       WHERE channel_id=?""",
+                    (
+                        f"Restore revision #{revision_id} as a new revision",
+                        revision_id,
+                        None if source_standard_revision_id is None else int(source_standard_revision_id),
+                        dt_to_db(utc_now()), restored_by, channel_id,
+                    ),
+                )
+                now = dt_to_db(utc_now())
+                await self.conn.execute(
+                    """INSERT INTO customization_audit_log(
+                           actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                       ) VALUES(?,'channel_custom',?,?, 'revision_restore_staged',NULL,?,?)""",
+                    (
+                        restored_by, channel_id, channel_id,
+                        json.dumps({
+                            "active_revision_id": active_revision_id,
+                            "target_revision_id": revision_id,
+                            "staged_keys": [item[0] for item in instructions],
+                            "skipped_keys": skipped_keys,
+                        }, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+                await self.conn.commit()
+                return {
+                    "target_revision_id": revision_id,
+                    "base_revision_id": active_revision_id,
+                    "staged": len(instructions),
+                    "skipped": len(skipped_keys),
+                }
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def discard_channel_custom_draft(self, *, channel_id: int, discarded_by: int) -> bool:
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                count = await self.get_channel_custom_draft_count(channel_id)
+                cursor = await self.conn.execute(
+                    "DELETE FROM channel_custom_drafts WHERE channel_id=?", (channel_id,)
+                )
+                if cursor.rowcount > 0:
+                    now = dt_to_db(utc_now())
+                    await self.conn.execute(
+                        """INSERT INTO customization_audit_log(
+                               actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                           ) VALUES(?,'channel_custom',?,?, 'draft_discarded',NULL,?,?)""",
+                        (discarded_by, channel_id, channel_id, json.dumps({"items": count}, sort_keys=True), now),
+                    )
+                await self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def publish_channel_custom_draft(
+        self, *, channel_id: int, published_by: int, summary: str | None = None
+    ) -> int:
+        """Atomically publish all draft items as one new immutable revision."""
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                state = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_state WHERE channel_id=?", (channel_id,)
+                )).fetchone()
+                draft = await (await self.conn.execute(
+                    "SELECT * FROM channel_custom_drafts WHERE channel_id=?", (channel_id,)
+                )).fetchone()
+                if state is None or draft is None:
+                    raise ValueError("Customization draft is empty")
+                active_revision_id = int(state["active_revision_id"])
+                base_revision_id = int(draft["base_revision_id"])
+                if active_revision_id != base_revision_id:
+                    raise DraftConflictError("Draft base revision is stale")
+                draft_rows = await (await self.conn.execute(
+                    """SELECT item_key,operation,item_type,payload_json
+                       FROM channel_custom_draft_items WHERE channel_id=? ORDER BY item_key""",
+                    (channel_id,),
+                )).fetchall()
+                if not draft_rows:
+                    raise ValueError("Customization draft is empty")
+
+                base_rows = await (await self.conn.execute(
+                    "SELECT item_key,item_type,payload_json FROM channel_custom_items WHERE revision_id=? ORDER BY item_key",
+                    (active_revision_id,),
+                )).fetchall()
+                items = {
+                    str(row["item_key"]): (str(row["item_type"]), str(row["payload_json"]))
+                    for row in base_rows
+                }
+                changed_keys: list[str] = []
+                from templates import TEMPLATE_REGISTRY, validate_template
+                for row in draft_rows:
+                    item_key = str(row["item_key"])
+                    operation = str(row["operation"])
+                    if operation == "delete":
+                        if item_key != "start_card.media":
+                            raise ValueError("Unsupported draft delete operation")
+                        items.pop(item_key, None)
+                    else:
+                        item_type = str(row["item_type"])
+                        raw_payload = str(row["payload_json"])
+                        try:
+                            parsed = json.loads(raw_payload)
+                        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                            raise ValueError("Invalid draft payload") from exc
+                        if item_type == CUSTOM_ITEM_TYPE_TEMPLATE_TEXT and item_key.startswith("template:"):
+                            template_key = item_key[len("template:"):]
+                            spec = TEMPLATE_REGISTRY.get(template_key)
+                            text = parsed.get("text") if isinstance(parsed, dict) else None
+                            if spec is None or spec.scope != "channel" or not isinstance(text, str):
+                                raise ValueError("Invalid draft template item")
+                            validate_template(template_key, text)
+                        elif item_type == CUSTOM_ITEM_TYPE_START_CARD_MEDIA and item_key == "start_card.media":
+                            media_type = parsed.get("media_type") if isinstance(parsed, dict) else None
+                            media_file_id = parsed.get("media_file_id") if isinstance(parsed, dict) else None
+                            if media_type not in {"photo", "video", "animation"} or not isinstance(media_file_id, str) or not media_file_id:
+                                raise ValueError("Invalid draft start-card media")
+                        else:
+                            raise ValueError("Unsupported draft item type")
+                        items[item_key] = (item_type, raw_payload)
+                    changed_keys.append(item_key)
+
+                publish_source = str(draft["publish_source"] or "manual_publish")
+                if publish_source not in {
+                    "manual_publish", "rollback", "reset_initial",
+                    "apply_current_standard", "copy_from_channel", "import",
+                }:
+                    raise ValueError("Unsupported draft publication source")
+                draft_summary = draft["publish_summary"]
+                effective_summary = summary or (str(draft_summary) if draft_summary else None)
+                if effective_summary is None:
+                    effective_summary = f"Publish {len(changed_keys)} draft item(s)"
+
+                restore_revision_id = draft["restore_revision_id"]
+                source_channel_id = draft["source_channel_id"]
+                draft_standard_revision_id = draft["source_standard_revision_id"]
+                effective_standard_revision_id = (
+                    int(draft_standard_revision_id)
+                    if draft_standard_revision_id is not None
+                    else (
+                        None if state["source_standard_revision_id"] is None
+                        else int(state["source_standard_revision_id"])
+                    )
+                )
+                if effective_standard_revision_id is not None:
+                    standard_exists = await (await self.conn.execute(
+                        "SELECT 1 FROM bot_standard_custom_revisions WHERE revision_id=?",
+                        (effective_standard_revision_id,),
+                    )).fetchone()
+                    if standard_exists is None:
+                        raise ValueError("Draft Standard Custom Pack source is unavailable")
+
+                if publish_source == "rollback":
+                    if restore_revision_id is None:
+                        raise ValueError("Rollback draft target is missing")
+                    target = await (await self.conn.execute(
+                        "SELECT 1 FROM channel_custom_revisions WHERE channel_id=? AND revision_id=?",
+                        (channel_id, int(restore_revision_id)),
+                    )).fetchone()
+                    if target is None:
+                        raise ValueError("Rollback draft target is unavailable")
+                elif restore_revision_id is not None:
+                    raise ValueError("Unexpected rollback target on non-rollback draft")
+
+                if publish_source == "copy_from_channel":
+                    if source_channel_id is None:
+                        raise ValueError("Copy draft source channel is missing")
+                    target_channel = await (await self.conn.execute(
+                        "SELECT owner_id FROM channels WHERE channel_id=? AND enabled=1", (channel_id,)
+                    )).fetchone()
+                    source_channel = await (await self.conn.execute(
+                        "SELECT owner_id FROM channels WHERE channel_id=? AND enabled=1", (int(source_channel_id),)
+                    )).fetchone()
+                    if (
+                        target_channel is None or source_channel is None
+                        or int(target_channel["owner_id"]) != published_by
+                        or int(source_channel["owner_id"]) != published_by
+                    ):
+                        raise PermissionError("Copy draft no longer belongs to the same owner")
+                elif source_channel_id is not None:
+                    raise ValueError("Unexpected source channel on non-copy draft")
+
+                if publish_source == "apply_current_standard" and effective_standard_revision_id is None:
+                    raise ValueError("Standard source is missing")
+
+                now = dt_to_db(utc_now())
+                cursor = await self.conn.execute(
+                    """INSERT INTO channel_custom_revisions(
+                           channel_id,source,source_standard_revision_id,created_at,created_by,summary
+                       ) VALUES(?,?,?,?,?,?)""",
+                    (
+                        channel_id, publish_source, effective_standard_revision_id,
+                        now, published_by, effective_summary,
+                    ),
+                )
+                revision_id = int(cursor.lastrowid)
+                if items:
+                    await self.conn.executemany(
+                        "INSERT INTO channel_custom_items(revision_id,item_key,item_type,payload_json) VALUES(?,?,?,?)",
+                        [(revision_id, key, item_type, payload) for key, (item_type, payload) in sorted(items.items())],
+                    )
+                await self.conn.execute(
+                    """UPDATE channel_custom_state
+                       SET active_revision_id=?,source_standard_revision_id=?,updated_at=?,updated_by=?
+                       WHERE channel_id=?""",
+                    (revision_id, effective_standard_revision_id, now, published_by, channel_id),
+                )
+
+                # Keep old storage as a compatibility mirror, but no owner edit
+                # writes directly to it after schema v26.
+                await self.conn.execute(
+                    "DELETE FROM channel_template_overrides WHERE channel_id=?", (channel_id,)
+                )
+                media = items.get("start_card.media")
+                if media is None:
+                    await self.conn.execute(
+                        "DELETE FROM channel_start_card_media WHERE channel_id=?", (channel_id,)
+                    )
+                else:
+                    _, raw_payload = media
+                    payload = json.loads(raw_payload)
+                    await self.conn.execute(
+                        """INSERT INTO channel_start_card_media(
+                               channel_id,media_type,media_file_id,updated_at,updated_by
+                           ) VALUES(?,?,?,?,?)
+                           ON CONFLICT(channel_id) DO UPDATE SET
+                               media_type=excluded.media_type,
+                               media_file_id=excluded.media_file_id,
+                               updated_at=excluded.updated_at,
+                               updated_by=excluded.updated_by""",
+                        (
+                            channel_id, str(payload["media_type"]), str(payload["media_file_id"]),
+                            now, published_by,
+                        ),
+                    )
+
+                await self.conn.execute(
+                    """INSERT INTO customization_audit_log(
+                           actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                       ) VALUES(?,'channel_custom',?,?, 'draft_published',NULL,?,?)""",
+                    (
+                        published_by, channel_id, channel_id,
+                        json.dumps({
+                            "base_revision_id": base_revision_id,
+                            "revision_id": revision_id,
+                            "changed_keys": sorted(set(changed_keys)),
+                            "source": publish_source,
+                            "restore_revision_id": None if restore_revision_id is None else int(restore_revision_id),
+                            "source_channel_id": None if source_channel_id is None else int(source_channel_id),
+                            "source_standard_revision_id": effective_standard_revision_id,
+                        }, ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+                await self.conn.execute(
+                    "DELETE FROM channel_custom_drafts WHERE channel_id=?", (channel_id,)
+                )
+                await self.conn.commit()
+                return revision_id
+            except Exception:
+                await self.conn.rollback()
+                raise
+
     # ------------------------------------------------------------------
     # Global pre-Start bot card. The Telegram description is bot-wide, so the
     # persisted draft is intentionally not keyed by channel_id.
     # ------------------------------------------------------------------
+    async def get_channel_start_card_media(self, channel_id: int) -> sqlite3.Row | None:
+        return await (await self.conn.execute(
+            "SELECT * FROM channel_start_card_media WHERE channel_id=?",
+            (channel_id,),
+        )).fetchone()
+
+    async def set_channel_start_card_media(
+        self, *, channel_id: int, media_type: str, media_file_id: str, updated_by: int
+    ) -> None:
+        if media_type not in {"photo", "video", "animation"}:
+            raise ValueError("Unsupported start-card media type")
+        file_id = media_file_id.strip() if isinstance(media_file_id, str) else ""
+        if not file_id or len(file_id) > 2048:
+            raise ValueError("Invalid start-card media file id")
+        now = dt_to_db(utc_now())
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT INTO channel_start_card_media(
+                       channel_id,media_type,media_file_id,updated_at,updated_by
+                   ) VALUES(?,?,?,?,?)
+                   ON CONFLICT(channel_id) DO UPDATE SET
+                       media_type=excluded.media_type,
+                       media_file_id=excluded.media_file_id,
+                       updated_at=excluded.updated_at,
+                       updated_by=excluded.updated_by""",
+                (channel_id, media_type, file_id, now, updated_by),
+            )
+            await self.conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(?,'channel_custom',?,?, 'channel_start_card_media_set','start_card.media',?,?)""",
+                (updated_by, channel_id, channel_id, json.dumps({"media_type": media_type}, sort_keys=True), now),
+            )
+            await self.conn.commit()
+
+    async def remove_channel_start_card_media(self, *, channel_id: int, updated_by: int) -> bool:
+        now = dt_to_db(utc_now())
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "DELETE FROM channel_start_card_media WHERE channel_id=?",
+                (channel_id,),
+            )
+            removed = bool(cursor.rowcount)
+            if removed:
+                await self.conn.execute(
+                    """INSERT INTO customization_audit_log(
+                           actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                       ) VALUES(?,'channel_custom',?,?, 'channel_start_card_media_removed','start_card.media',NULL,?)""",
+                    (updated_by, channel_id, channel_id, now),
+                )
+            await self.conn.commit()
+            return removed
+
     async def get_bot_prestart_card(self) -> sqlite3.Row | None:
         return await (await self.conn.execute(
             "SELECT * FROM bot_prestart_card WHERE singleton_id=1"
         )).fetchone()
 
     async def set_bot_prestart_description(self, *, description: str | None, updated_by: int) -> None:
+        now = dt_to_db(utc_now())
         async with self._write_lock:
             await self.conn.execute(
                 """INSERT INTO bot_prestart_card(singleton_id,description_override,media_type,media_file_id,updated_at,updated_by)
@@ -1184,13 +3821,20 @@ class Database:
                    ON CONFLICT(singleton_id) DO UPDATE SET
                      description_override=excluded.description_override,
                      updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
-                (description, dt_to_db(utc_now()), updated_by),
+                (description, now, updated_by),
+            )
+            await self.conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(?,'global_profile',1,NULL,'global_prestart_description_set','prestart.description',?,?)""",
+                (updated_by, json.dumps({"length": len(description or "")}, sort_keys=True), now),
             )
             await self.conn.commit()
 
     async def set_bot_prestart_media(self, *, media_type: str, media_file_id: str, updated_by: int) -> None:
         if media_type not in {"photo", "video", "animation"} or not media_file_id:
             raise ValueError("Unsupported pre-start media")
+        now = dt_to_db(utc_now())
         async with self._write_lock:
             await self.conn.execute(
                 """INSERT INTO bot_prestart_card(singleton_id,description_override,media_type,media_file_id,updated_at,updated_by)
@@ -1198,29 +3842,53 @@ class Database:
                    ON CONFLICT(singleton_id) DO UPDATE SET
                      media_type=excluded.media_type, media_file_id=excluded.media_file_id,
                      updated_at=excluded.updated_at, updated_by=excluded.updated_by""",
-                (media_type, media_file_id, dt_to_db(utc_now()), updated_by),
+                (media_type, media_file_id, now, updated_by),
+            )
+            await self.conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(?,'global_profile',1,NULL,'global_prestart_media_set','prestart.media',?,?)""",
+                (updated_by, json.dumps({"media_type": media_type}, sort_keys=True), now),
             )
             await self.conn.commit()
 
     async def remove_bot_prestart_media(self, *, updated_by: int) -> None:
+        now = dt_to_db(utc_now())
         async with self._write_lock:
             row = await (await self.conn.execute(
-                "SELECT description_override FROM bot_prestart_card WHERE singleton_id=1"
+                "SELECT description_override,media_type FROM bot_prestart_card WHERE singleton_id=1"
             )).fetchone()
-            if row is None:
+            if row is None or row["media_type"] is None:
                 return
             if row["description_override"] is None:
                 await self.conn.execute("DELETE FROM bot_prestart_card WHERE singleton_id=1")
             else:
                 await self.conn.execute(
                     "UPDATE bot_prestart_card SET media_type=NULL,media_file_id=NULL,updated_at=?,updated_by=? WHERE singleton_id=1",
-                    (dt_to_db(utc_now()), updated_by),
+                    (now, updated_by),
                 )
+            await self.conn.execute(
+                """INSERT INTO customization_audit_log(
+                       actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                   ) VALUES(?,'global_profile',1,NULL,'global_prestart_media_removed','prestart.media',NULL,?)""",
+                (updated_by, now),
+            )
             await self.conn.commit()
 
-    async def reset_bot_prestart_card(self) -> None:
+    async def reset_bot_prestart_card(self, *, updated_by: int | None = None) -> None:
+        now = dt_to_db(utc_now())
         async with self._write_lock:
+            row = await (await self.conn.execute(
+                "SELECT 1 FROM bot_prestart_card WHERE singleton_id=1"
+            )).fetchone()
             await self.conn.execute("DELETE FROM bot_prestart_card WHERE singleton_id=1")
+            if row is not None:
+                await self.conn.execute(
+                    """INSERT INTO customization_audit_log(
+                           actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+                       ) VALUES(?,'global_profile',1,NULL,'global_prestart_reset',NULL,NULL,?)""",
+                    (updated_by, now),
+                )
             await self.conn.commit()
 
     # ------------------------------------------------------------------
@@ -1573,24 +4241,182 @@ class Database:
     # Channels. owner_id identifies a human owner; channel_id identifies a
     # concrete configured submission channel.
     # ------------------------------------------------------------------
+    async def _custom_pack_foundation_is_active_locked(self) -> bool:
+        """Return whether schema v23 is active on this database.
+
+        Migration tests deliberately open older schema versions with the current
+        Database class.  In those fixtures register_channel must retain the old
+        behaviour.  Once v23 is recorded, however, missing customization tables
+        are treated as corruption and setup fails closed rather than creating a
+        channel without its required immutable customization snapshot.
+        """
+        row = await (await self.conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE version=23 AND name='custom_pack_foundation'"
+        )).fetchone()
+        return row is not None
+
+    async def _snapshot_active_standard_for_channel_locked(
+        self,
+        *,
+        channel_id: int,
+        owner_id: int,
+        created_at: datetime,
+    ) -> tuple[int, int]:
+        """Copy the active Standard Custom Pack into a new channel.
+
+        The caller must hold ``_write_lock`` and an open write transaction.
+        No commit is performed here: channel creation, anonymous counter, custom
+        snapshot, state and audit are one atomic unit.
+        """
+        standard_state = await (await self.conn.execute(
+            "SELECT active_revision_id FROM bot_standard_custom_state WHERE singleton_id=1"
+        )).fetchone()
+        if standard_state is None:
+            raise DatabaseMigrationError(
+                "Standard Custom Pack state is missing; refusing partial channel setup"
+            )
+        standard_revision_id = int(standard_state["active_revision_id"])
+        standard_revision = await (await self.conn.execute(
+            "SELECT 1 FROM bot_standard_custom_revisions WHERE revision_id=?",
+            (standard_revision_id,),
+        )).fetchone()
+        if standard_revision is None:
+            raise DatabaseMigrationError(
+                "Active Standard Custom Pack revision is missing"
+            )
+        item_count = int((await (await self.conn.execute(
+            "SELECT COUNT(*) AS c FROM bot_standard_custom_items WHERE revision_id=?",
+            (standard_revision_id,),
+        )).fetchone())["c"])
+        if item_count < 1:
+            raise DatabaseMigrationError(
+                "Active Standard Custom Pack is empty; refusing partial channel setup"
+            )
+
+        now_value = dt_to_db(created_at)
+        revision_cursor = await self.conn.execute(
+            """INSERT INTO channel_custom_revisions(
+                   channel_id,source,source_standard_revision_id,created_at,created_by,summary
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                channel_id,
+                "setup_snapshot",
+                standard_revision_id,
+                now_value,
+                owner_id,
+                "Initial channel customization snapshot from active Standard Custom Pack",
+            ),
+        )
+        revision_id = int(revision_cursor.lastrowid)
+        await self.conn.execute(
+            """INSERT INTO channel_custom_items(revision_id,item_key,item_type,payload_json)
+               SELECT ?,item_key,item_type,payload_json
+               FROM bot_standard_custom_items
+               WHERE revision_id=?
+               ORDER BY item_key""",
+            (revision_id, standard_revision_id),
+        )
+        await self.conn.execute(
+            """INSERT INTO channel_custom_state(
+                   channel_id,active_revision_id,initial_revision_id,source_standard_revision_id,updated_at,updated_by
+               ) VALUES(?,?,?,?,?,?)""",
+            (
+                channel_id,
+                revision_id,
+                revision_id,
+                standard_revision_id,
+                now_value,
+                owner_id,
+            ),
+        )
+        await self.conn.execute(
+            """INSERT INTO customization_audit_log(
+                   actor_user_id,scope_type,scope_id,channel_id,action,target_key,metadata_json,created_at
+               ) VALUES(?,'channel_custom',?,?, 'setup_snapshot',NULL,?,?)""",
+            (
+                owner_id,
+                channel_id,
+                channel_id,
+                json.dumps(
+                    {
+                        "revision_id": revision_id,
+                        "source_standard_revision_id": standard_revision_id,
+                        "items": item_count,
+                    },
+                    sort_keys=True,
+                ),
+                now_value,
+            ),
+        )
+        return revision_id, standard_revision_id
+
     async def register_channel(self, *, owner_id: int, group_id: int, group_title: str, default_reset_days: int, default_notice_text: str, default_timezone: str, anonymous_prefix: str = "Анон") -> tuple[str, sqlite3.Row | None]:
         now = utc_now()
         normalized_prefix = self.normalize_anonymous_prefix(anonymous_prefix)
         async with self._write_lock:
-            row = await (await self.conn.execute("SELECT * FROM channels WHERE group_id=?", (group_id,))).fetchone()
-            if row is not None:
-                if int(row["owner_id"]) != owner_id: return "group_has_other_owner", row
-                await self.conn.execute("UPDATE channels SET group_title=?, updated_at=?, enabled=1 WHERE channel_id=?", (group_title, dt_to_db(now), row["channel_id"]))
+            transaction_started = False
+            try:
+                # Serialise the ownership/limit check with creation and the
+                # Standard Pack snapshot.  This also guarantees that a failed
+                # snapshot cannot leave a half-configured channel behind.
+                await self.conn.execute("BEGIN IMMEDIATE")
+                transaction_started = True
+                row = await (await self.conn.execute(
+                    "SELECT * FROM channels WHERE group_id=?", (group_id,)
+                )).fetchone()
+                if row is not None:
+                    if int(row["owner_id"]) != owner_id:
+                        await self.conn.rollback()
+                        return "group_has_other_owner", row
+                    await self.conn.execute(
+                        "UPDATE channels SET group_title=?, updated_at=?, enabled=1 WHERE channel_id=?",
+                        (group_title, dt_to_db(now), row["channel_id"]),
+                    )
+                    await self.conn.commit()
+                    return "existing", await (await self.conn.execute(
+                        "SELECT * FROM channels WHERE channel_id=?", (row["channel_id"],)
+                    )).fetchone()
+
+                count = (await (await self.conn.execute(
+                    "SELECT COUNT(*) AS c FROM channels WHERE owner_id=?", (owner_id,)
+                )).fetchone())["c"]
+                if int(count) >= 5:
+                    await self.conn.rollback()
+                    return "owner_channel_limit", None
+
+                next_reset = now + timedelta(days=default_reset_days)
+                cursor = await self.conn.execute(
+                    """INSERT INTO channels(
+                           owner_id,group_id,group_title,created_at,updated_at,reset_interval_days,
+                           notice_text,timezone_name,next_reset_at,enabled,auto_cleanup_enabled,anonymous_prefix
+                       ) VALUES(?,?,?,?,?,?,?,?,?,1,1,?)""",
+                    (
+                        owner_id, group_id, group_title, dt_to_db(now), dt_to_db(now),
+                        default_reset_days, default_notice_text, default_timezone,
+                        dt_to_db(next_reset), normalized_prefix,
+                    ),
+                )
+                channel_id = int(cursor.lastrowid)
+                await self.conn.execute(
+                    "INSERT INTO channel_anonymous_counters(channel_id,next_number,cycle_key) VALUES(?,1,?)",
+                    (channel_id, dt_to_db(next_reset)),
+                )
+
+                if await self._custom_pack_foundation_is_active_locked():
+                    await self._snapshot_active_standard_for_channel_locked(
+                        channel_id=channel_id,
+                        owner_id=owner_id,
+                        created_at=now,
+                    )
+
                 await self.conn.commit()
-                return "existing", await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=?", (row["channel_id"],))).fetchone()
-            count = (await (await self.conn.execute("SELECT COUNT(*) AS c FROM channels WHERE owner_id=?", (owner_id,))).fetchone())["c"]
-            if int(count) >= 5: return "owner_channel_limit", None
-            next_reset=now+timedelta(days=default_reset_days)
-            cursor=await self.conn.execute("""INSERT INTO channels(owner_id,group_id,group_title,created_at,updated_at,reset_interval_days,notice_text,timezone_name,next_reset_at,enabled,auto_cleanup_enabled,anonymous_prefix) VALUES(?,?,?,?,?,?,?,?,?,1,1,?)""",(owner_id,group_id,group_title,dt_to_db(now),dt_to_db(now),default_reset_days,default_notice_text,default_timezone,dt_to_db(next_reset),normalized_prefix))
-            channel_id=int(cursor.lastrowid)
-            await self.conn.execute("INSERT INTO channel_anonymous_counters(channel_id,next_number,cycle_key) VALUES(?,1,?)",(channel_id,dt_to_db(next_reset)))
-            await self.conn.commit()
-            return "created", await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=?",(channel_id,))).fetchone()
+                return "created", await (await self.conn.execute(
+                    "SELECT * FROM channels WHERE channel_id=?", (channel_id,)
+                )).fetchone()
+            except Exception:
+                if transaction_started:
+                    await self.conn.rollback()
+                raise
 
     async def get_channel_by_id(self, channel_id:int) -> sqlite3.Row|None:
         return await (await self.conn.execute("SELECT * FROM channels WHERE channel_id=? AND enabled=1",(channel_id,))).fetchone()

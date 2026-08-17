@@ -17,6 +17,82 @@ class ChannelLike(Protocol):
     def __getitem__(self, key: str) -> object: ...
 
 
+class GlobalRole(str, Enum):
+    SUPERADMIN = "superadmin"
+
+
+class GlobalAction(str, Enum):
+    SUPERADMIN_PANEL = "superadmin_panel"
+    PRESTART_PROFILE = "prestart_profile"
+    STANDARD_PACK = "standard_pack"
+
+
+@dataclass(frozen=True)
+class GlobalAuthorizationResult:
+    role: GlobalRole | None
+    action: GlobalAction
+    reason: str | None = None
+
+    @property
+    def allowed(self) -> bool:
+        return self.role is GlobalRole.SUPERADMIN
+
+
+def parse_superadmin_telegram_id(raw_value: str | None) -> int | None:
+    """Parse SUPERADMIN_TELEGRAM_ID without ever granting access on bad input."""
+    if not isinstance(raw_value, str):
+        return None
+    value = raw_value.strip()
+    if not value:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def is_superadmin(actor_id: int | None, configured_superadmin_id: int | None) -> bool:
+    """Return True only for the one explicitly configured global bot owner.
+
+    The global role is deliberately independent from channel ownership and
+    Telegram group-administrator status.  Missing/invalid configuration is
+    represented as ``None`` and therefore fails closed.
+    """
+    return (
+        isinstance(actor_id, int)
+        and isinstance(configured_superadmin_id, int)
+        and configured_superadmin_id > 0
+        and actor_id == configured_superadmin_id
+    )
+
+
+class GlobalAuthorizer:
+    """Authorization gate for settings that belong to the bot account itself."""
+
+    def __init__(self, *, superadmin_telegram_id: int | None) -> None:
+        self.superadmin_telegram_id = (
+            superadmin_telegram_id
+            if isinstance(superadmin_telegram_id, int) and superadmin_telegram_id > 0
+            else None
+        )
+
+    def is_superadmin(self, actor_id: int | None) -> bool:
+        return is_superadmin(actor_id, self.superadmin_telegram_id)
+
+    def require(
+        self,
+        *,
+        actor_id: int | None,
+        action: GlobalAction,
+    ) -> GlobalAuthorizationResult:
+        if self.superadmin_telegram_id is None:
+            return GlobalAuthorizationResult(None, action, "superadmin_not_configured")
+        if not self.is_superadmin(actor_id):
+            return GlobalAuthorizationResult(None, action, "superadmin_required")
+        return GlobalAuthorizationResult(GlobalRole.SUPERADMIN, action)
+
+
 class ChannelRole(str, Enum):
     SUBSCRIBER = "subscriber"
     ADMIN = "admin"

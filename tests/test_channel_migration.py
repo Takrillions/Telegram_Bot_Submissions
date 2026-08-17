@@ -8,7 +8,7 @@ from pathlib import Path
 import aiosqlite
 
 from database import CURRENT_SCHEMA_VERSION, Database, DEFAULT_MIGRATIONS, Migration, apply_legacy_schema, utc_now
-from handlers import render_topic_card, statistics_duration, statistics_keyboard, statistics_text, topic_name, validate_topic_template
+from handlers import render_statistics_page, render_topic_card, statistics_duration, statistics_keyboard, statistics_text, topic_name, validate_topic_template
 
 
 class ChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -550,7 +550,14 @@ class ChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         await db.close()
 
 
-    def test_statistics_ui_uses_precalculated_data_safe_callbacks_and_legacy_warning(self):
+    async def test_statistics_ui_uses_precalculated_data_safe_callbacks_and_legacy_warning(self):
+        db = Database(self.path)
+        await db.init()
+        _, channel = await db.register_channel(
+            owner_id=1, group_id=-5001, group_title='Stats',
+            default_reset_days=30, default_notice_text='n', default_timezone='UTC',
+        )
+        channel_id = int(channel['channel_id'])
         stats = {
             'period': '7d', 'conversation_metrics_complete': False,
             'unique_subscribers': 3, 'active_subscribers_1d': 1, 'active_subscribers_7d': 2, 'active_subscribers_30d': 3,
@@ -567,11 +574,11 @@ class ChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
                 {'privacy_mode': 'identified', 'display_name': 'Мария', 'message_count': 8},
             ],
         }
-        overview = statistics_text(stats, 'overview')
-        messages = statistics_text(stats, 'messages')
-        responses = statistics_text(stats, 'responses')
-        activity = statistics_text(stats, 'activity')
-        top = statistics_text(stats, 'top')
+        overview = await statistics_text(db, channel_id, stats, 'overview')
+        messages = await statistics_text(db, channel_id, stats, 'messages')
+        responses = await statistics_text(db, channel_id, stats, 'responses')
+        activity = await statistics_text(db, channel_id, stats, 'activity')
+        top = await statistics_text(db, channel_id, stats, 'top')
         self.assertIn('Фото: 2', messages)
         self.assertIn('4 мин 12 сек', responses)
         self.assertIn('09:00', activity)
@@ -579,17 +586,21 @@ class ChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('user_id', top)
         self.assertNotIn('username', top)
         stats['conversation_metrics_complete'] = True
-        self.assertNotIn('Для части старых обращений детальная статистика ответов недоступна.', statistics_text(stats, 'overview'))
+        self.assertNotIn('Для части старых обращений детальная статистика ответов недоступна.', await render_statistics_page(db=db, channel_id=channel_id, stats=stats, page='overview'))
         self.assertEqual((statistics_duration(None), statistics_duration(35), statistics_duration(252), statistics_duration(4080)), ('—', '35 сек', '4 мин 12 сек', '1 ч 8 мин'))
-        keyboard = statistics_keyboard(source='stats', page='activity', period='30d')
+        keyboard = await statistics_keyboard(db=db, channel_id=channel_id, source='stats', page='activity', period='30d')
         callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         self.assertIn('stats:top:30d', callbacks)
         self.assertIn('stats:activity:7d', callbacks)
         self.assertTrue(all(len(str(data)) <= 64 for data in callbacks))
         self.assertTrue(all('Анон-1' not in str(data) and 'Мария' not in str(data) for data in callbacks))
-        panel_callbacks = [button.callback_data for row in statistics_keyboard(source='panel', page='top', period='today').inline_keyboard for button in row]
+        panel_keyboard = await statistics_keyboard(db=db, channel_id=channel_id, source='panel', page='top', period='today')
+        panel_callbacks = [button.callback_data for row in panel_keyboard.inline_keyboard for button in row]
         self.assertIn('panel:stats:overview:today', panel_callbacks)
         self.assertIn('panel:home', panel_callbacks)
+        stats['conversation_metrics_complete'] = False
+        self.assertIn('Для части старых обращений детальная статистика ответов недоступна.', await render_statistics_page(db=db, channel_id=channel_id, stats=stats, page='overview'))
+        await db.close()
 
     def test_statistics_handlers_use_one_api_and_reauthorize_callbacks(self):
         source = Path('handlers.py').read_text(encoding='utf-8')
@@ -616,7 +627,7 @@ class ChannelMigrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('async def panel_callback(callback: CallbackQuery, state: FSMContext)', source)
         self.assertIn('def forum_topic_url', source)
         self.assertIn('raw.startswith("-100")', source)
-        self.assertIn('InlineKeyboardButton(text="Открыть", url=topic_url)', source)
+        self.assertIn('InlineKeyboardButton(text=await render_label(db, channel_id, "ui.search.open"), url=topic_url)', source)
 
     async def test_search_is_channel_scoped_privacy_safe_and_escapes_like(self):
         db = Database(self.path); await db.init()

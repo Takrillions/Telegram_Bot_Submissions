@@ -9,6 +9,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
+from authorization import parse_superadmin_telegram_id
 from command_menu import sync_command_menus
 from database import Database
 from release_runtime import clear_readiness, write_readiness
@@ -29,6 +30,7 @@ class Settings:
     database_backup_keep: int
     readiness_path: str
     release_id: str
+    superadmin_telegram_id: int | None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -57,6 +59,10 @@ class Settings:
         if backup_keep < 1:
             raise RuntimeError("DATABASE_BACKUP_KEEP must be at least 1")
 
+        superadmin_telegram_id = parse_superadmin_telegram_id(
+            os.getenv("SUPERADMIN_TELEGRAM_ID")
+        )
+
         return cls(
             bot_token=token,
             database_path=os.getenv(
@@ -78,6 +84,7 @@ class Settings:
             database_backup_keep=backup_keep,
             readiness_path=os.getenv("READINESS_PATH", "").strip(),
             release_id=os.getenv("RELEASE_ID", "local").strip() or "local",
+            superadmin_telegram_id=superadmin_telegram_id,
         )
 
 
@@ -113,12 +120,20 @@ async def migrate_only() -> tuple[int, ...]:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
     settings = Settings.from_env()
+    if settings.superadmin_telegram_id is None:
+        logging.getLogger(__name__).warning(
+            "SUPERADMIN_TELEGRAM_ID is not configured; global bot-profile and Standard Custom Pack editing are disabled"
+        )
     clear_readiness(settings.readiness_path)
     db = await _create_database(settings)
     await db.init()
     bot = Bot(token=settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     me = await bot.get_me()
-    await sync_command_menus(bot=bot, db=db)
+    await sync_command_menus(
+        bot=bot,
+        db=db,
+        superadmin_telegram_id=settings.superadmin_telegram_id,
+    )
     runtime = FeedbackRuntime(bot=bot, db=db, media_group_delay=settings.media_group_delay)
     cleaner = TopicCleaner(bot=bot, db=db)
     dp = Dispatcher()

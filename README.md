@@ -25,7 +25,7 @@ Anonymous и identified используют разные forum topics. Пере
 
 ## Администраторы и права
 
-`channels.owner_id` — единственный источник истины для главного администратора канала. Обычные Telegram-администраторы могут работать в пользовательских ветках и выполнять разрешённую модерацию. Настройки канала, статистика, экспорт, массовая рассылка и конфигурация реакций доступны владельцу.
+`channels.owner_id` — единственный источник истины для главного администратора конкретного канала. Отдельно существует глобальный `SUPERADMIN_TELEGRAM_ID` из production `.env`: только он может менять профильные настройки самого Telegram-бота, включая настоящую карточку до Start. SUPERADMIN не получает права на чужие `channel_id` автоматически. Обычные Telegram-администраторы могут работать в пользовательских ветках и выполнять разрешённую модерацию. Настройки канала, статистика, экспорт, массовая рассылка и конфигурация реакций доступны владельцу этого канала.
 
 Чувствительные действия повторно проверяют текущий Telegram admin status server-side; callback data не считается доказательством прав. Подробности: `docs/authorization-matrix.md`.
 
@@ -39,9 +39,10 @@ Anonymous и identified используют разные forum topics. Пере
 - статистика подписчицы, канала и администраторов;
 - privacy-safe поиск;
 - CSV/XLSX export;
-- channel-scoped редактор Telegram-реплик;
+- channel-scoped редактор Telegram-реплик с обычным Telegram-форматированием и человекочитаемыми динамическими полями;
 - настраиваемые anonymous prefix/counter и карточки подписчиц;
-- глобальная карточка до Start;
+- глобальная карточка до Start, доступная только SUPERADMIN;
+- отдельная channel-scoped стартовая карточка после Start: независимый текст и photo/video/GIF для каждого `channel_id`;
 - массовая рассылка из General, включая albums;
 - два режима реакций администраторов;
 - автоматическая и ручная очистка forum topics;
@@ -62,13 +63,21 @@ Anonymous и identified используют разные forum topics. Пере
 
 В forum-супергруппе команды вводятся вручную. Bot API не умеет ограничивать command scope только темой General, поэтому групповое slash-меню намеренно не публикуется. Контекст каждой команды проверяется server-side. Подробности: `docs/telegram-command-scopes.md`.
 
+В личном чате slash-меню зависит от роли: обычный пользователь видит только пользовательские команды, CHANNEL_OWNER — также `/panel` и `/search`, а настроенный SUPERADMIN — `/superadmin`. Если SUPERADMIN одновременно является владельцем предложки, команды объединяются в одном private scope.
+
 ## Настройка канала
 
-Основная точка управления — `/panel`. Там доступны существующие настройки канала, статистика/export, тексты, anonymous settings, cleanup, pre-Start card и другие owner-only функции.
+Основная точка управления конкретной предложкой — `/panel`. Там доступны настройки канала, статистика/export, тексты, anonymous settings, cleanup и другие owner-only функции. Глобальные настройки вынесены из channel panel в отдельный private-only `/superadmin`: этот раздел доступен только пользователю, чей Telegram ID совпадает с `SUPERADMIN_TELEGRAM_ID`, и не требует владения каким-либо channel_id.
 
 Массовая рассылка запускается `/broadcast` только владельцем из General. Подробности: `docs/mass-broadcast.md`.
 
 Настройка реакций также выполняется владельцем из General. Подробности: `docs/reaction-routing.md`.
+
+В private `/panel` есть owner-only режим **«Посмотреть глазами подписчика»**. Он рендерит стартовую карточку, privacy prompt, подтверждение получения сообщения, unavailable-сценарий, пример санкции, пример ответа администратора и cleanup notice. Если есть customization draft, preview накладывает его поверх опубликованной revision. Preview не регистрирует подписчика, не меняет active channel/privacy, не создаёт forum topics и не пишет message analytics. Все preview-сообщения имеют неснимаемую системную метку. Подробности: `docs/subscriber-preview.md`.
+
+## Фундамент изолированной кастомизации
+
+Schema v23 добавляет immutable Standard Custom Pack и per-channel Custom Pack snapshots. Для новых каналов `/setup` атомарно копирует активную Standard revision в независимый `setup_snapshot`; ошибка snapshot полностью откатывает создание канала. Повторный setup существующего канала snapshot не заменяет. Schema v24 добавляет channel-scoped media стартовой карточки, v25 расширяет безопасно кастомизируемую template surface, v26 переводит owner-редактор на persistent drafts, v27 добавляет owner-facing историю immutable revisions, audit и безопасное восстановление старой версии сначала в черновик, v28 добавляет безопасные bulk-инструменты, v29 — versioned JSON import/export Channel Custom Pack, а v30 окончательно отделяет Global Bot Profile от Standard Custom Pack и добавляет отдельный SUPERADMIN-редактор текущего стандарта. Активный Standard Pack после v30 содержит только channel-scoped templates и опциональное `start_card.media`; каждая правка создаёт новую immutable Standard revision и влияет только на будущие `/setup`. Существующие Channel Custom Pack snapshots не переписываются и не наследуют изменения автоматически. Обычный runtime читает только опубликованную immutable channel revision; черновик доступен только preview-поверхностям. `channel_template_overrides` после v26 остаётся только compatibility storage. Подробности: `docs/customization-architecture.md`, `docs/customization-bulk-tools.md` и `docs/customization-transfer-json.md`.
 
 ## SQLite и миграции
 
@@ -81,7 +90,7 @@ Anonymous и identified используют разные forum topics. Пере
 - forum topic mappings;
 - message event journal;
 - sanctions/moderation metadata;
-- template overrides;
+- immutable channel custom revisions + persistent customization drafts;
 - broadcasts/delivery journal;
 - reaction routing state;
 - pre-Start card state.
@@ -93,6 +102,7 @@ Anonymous и identified используют разные forum topics. Пере
 Ключевые переменные:
 
 - `BOT_TOKEN`;
+- `SUPERADMIN_TELEGRAM_ID` — числовой Telegram ID глобального владельца бота;
 - `DATABASE_PATH`;
 - `DATABASE_BACKUP_DIR` / `DATABASE_BACKUP_KEEP`;
 - `DATABASE_REMOTE_BACKUP_BUCKET` / prefix / retention;
@@ -155,3 +165,8 @@ Production использует release layout с общей `.env`, БД, backu
 ## Намеренно сохранённая совместимость
 
 Некоторые legacy/fallback пути остаются специально для безопасной миграции старой БД и обработки старых Telegram callbacks/deep-links. Их список и причины сохранения находятся в `docs/compatibility-inventory.md`.
+
+
+## Pre-deploy CI gate
+
+Перед production deploy GitHub Actions запускает обязательный `verify`-job с реальными зависимостями и полным unittest suite. `deploy` имеет `needs: verify`, поэтому при ошибке проверок production не изменяется.

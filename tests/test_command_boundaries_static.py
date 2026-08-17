@@ -38,12 +38,23 @@ class CommandBoundaryStaticTests(unittest.TestCase):
         generic = function_source("admin_group_message_handler")
         self.assertIn("if message_is_admin_command(message)", generic)
 
-    def test_command_menu_uses_private_scopes_only(self):
+    def test_command_menu_publishes_private_scopes_and_only_deletes_group_scopes(self):
         self.assertIn("BotCommandScopeAllPrivateChats", COMMAND_MENU)
-        self.assertIn("BotCommandScopeChat", COMMAND_MENU)
-        self.assertNotIn("BotCommandScopeAllGroupChats", COMMAND_MENU)
-        self.assertNotIn("BotCommandScopeChatAdministrators", COMMAND_MENU)
-        self.assertNotIn("BotCommandScopeAllChatAdministrators", COMMAND_MENU)
+        self.assertIn("async def _clear_group_command_scopes", COMMAND_MENU)
+        clear_source = COMMAND_MENU[
+            COMMAND_MENU.index("async def _clear_group_command_scopes"):
+            COMMAND_MENU.index("async def _has_live_owner_role")
+        ]
+        self.assertIn("BotCommandScopeAllGroupChats", clear_source)
+        self.assertIn("BotCommandScopeChatAdministrators", clear_source)
+        self.assertIn("BotCommandScopeAllChatAdministrators", clear_source)
+        self.assertNotIn("set_my_commands", clear_source)
+
+        sync_source = COMMAND_MENU[COMMAND_MENU.index("async def sync_command_menus"):]
+        self.assertIn("BotCommandScopeAllPrivateChats", sync_source)
+        self.assertIn("BotCommandScopeChat(chat_id=actor_id)", sync_source)
+        self.assertNotIn("set_my_commands(list(GENERAL_OWNER_COMMANDS)", sync_source)
+        self.assertNotIn("set_my_commands(list(TOPIC_ADMIN_COMMANDS)", sync_source)
 
 
 if __name__ == "__main__":
