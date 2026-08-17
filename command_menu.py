@@ -16,6 +16,7 @@ older release.
 from __future__ import annotations
 
 from aiogram.enums import ChatMemberStatus
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllChatAdministrators,
@@ -68,10 +69,17 @@ async def _clear_group_command_scopes(*, bot, channels) -> None:
 
     group_ids = sorted({int(channel["group_id"]) for channel in channels})
     for group_id in group_ids:
-        await bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=group_id))
-        await bot.delete_my_commands(
-            scope=BotCommandScopeChatAdministrators(chat_id=group_id)
-        )
+        try:
+            await bot.delete_my_commands(
+                scope=BotCommandScopeChat(chat_id=group_id)
+            )
+            await bot.delete_my_commands(
+                scope=BotCommandScopeChatAdministrators(chat_id=group_id)
+            )
+        except (TelegramForbiddenError, TelegramBadRequest):
+            # A stale channel may remain in the database after the bot was
+            # removed from the supergroup. It must not prevent bot startup.
+            continue
 
 
 async def _has_live_owner_role(*, bot, channels, owner_id: int) -> bool:

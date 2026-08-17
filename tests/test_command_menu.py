@@ -1,5 +1,6 @@
 import unittest
 
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.types import (
     BotCommandScopeAllChatAdministrators,
     BotCommandScopeAllGroupChats,
@@ -45,7 +46,51 @@ class _Bot:
         return type("Member", (), {"status": status})()
 
 
+class _BotWithStaleGroup(_Bot):
+    async def delete_my_commands(self, *, scope):
+        self.calls.append(("delete", None, scope))
+        if (
+            isinstance(scope, BotCommandScopeChat)
+            and int(scope.chat_id) == -1009
+        ):
+            raise TelegramForbiddenError(
+                method=None,
+                message="Forbidden: bot was kicked from the supergroup chat",
+            )
+
+    async def get_chat_member(self, group_id, user_id):
+        if int(group_id) == -1009:
+            raise TelegramForbiddenError(
+                method=None,
+                message="Forbidden: bot was kicked from the supergroup chat",
+            )
+        return await super().get_chat_member(group_id, user_id)
+
+
 class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stale_supergroup_does_not_abort_command_menu_sync(self):
+        bot = _BotWithStaleGroup()
+
+        await sync_command_menus(
+            bot=bot,
+            db=_Database(),
+            superadmin_telegram_id=9,
+        )
+
+        private_sets = [
+            call
+            for call in bot.calls
+            if call[0] == "set"
+            and (
+                isinstance(call[2], BotCommandScopeAllPrivateChats)
+                or (
+                    isinstance(call[2], BotCommandScopeChat)
+                    and int(call[2].chat_id) > 0
+                )
+            )
+        ]
+        self.assertTrue(private_sets)
+
     async def test_only_private_scopes_are_ever_set(self):
         bot = _Bot()
         await sync_command_menus(bot=bot, db=_Database(), superadmin_telegram_id=9)
